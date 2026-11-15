@@ -1,0 +1,28 @@
+cat > .gitignore << 'EOF'
+# Secrets (keep the example file)
+.env
+.env.*
+!.env.example
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+
+# Logs
+*.log
+
+# Generated / runtime data
+src/session3/chroma_db/
+src/session3/JSON-chat-history/
+src/session3/pdfs/
+
+# Editors / OS
+.vscode/
+.idea/
+.DS_Store
+EOF
