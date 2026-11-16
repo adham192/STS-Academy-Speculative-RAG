@@ -16,8 +16,6 @@ import chromadb
 import pymupdf
 import ollama
 from dotenv import load_dotenv
-from google import genai
-from google.genai import types
 from sklearn.cluster import KMeans
 
 HERE = Path(__file__).resolve()
@@ -47,15 +45,15 @@ OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY")
 EMBED_MODEL = os.getenv("OPENROUTER_MODEL")
 OLLAMA_HOST = os.getenv("OLLAMA_HOST")
 DRAFT_MODEL = os.getenv("LOCAL_MODEL")
-GEMINI_API_KEY = os.getenv("api-key")
-VERIFY_MODEL = os.getenv("model")
+VERIFY_API_KEY = os.getenv("api-key")      # OpenRouter key used for verification
+VERIFY_MODEL = os.getenv("model")          # OpenRouter model id, e.g. qwen/qwen3.7-flash
 
 REQUIRED = {
     "OPENROUTER_API_KEY": OPENROUTER_API_KEY,
     "OPENROUTER_MODEL": EMBED_MODEL,
     "OLLAMA_HOST": OLLAMA_HOST,
     "LOCAL_MODEL": DRAFT_MODEL,
-    "api-key": GEMINI_API_KEY,
+    "api-key": VERIFY_API_KEY,
     "model": VERIFY_MODEL,
 }
 missing = [name for name, value in REQUIRED.items() if not value]
@@ -64,13 +62,8 @@ if missing:
     raise RuntimeError(f"Missing values in .env: {', '.join(missing)}")
 
 ollama_client = ollama.Client(host=OLLAMA_HOST, timeout=None)
-gemini_client = genai.Client(
-    api_key=GEMINI_API_KEY,
-    http_options=types.HttpOptions(
-        timeout=45_000,
-        retry_options=types.HttpRetryOptions(attempts=1),
-    ),
-)
+OPENROUTER_CHAT_URL = "https://openrouter.ai/api/v1/chat/completions"
+VERIFY_TIMEOUT = 90  # seconds per verification request
 
 # Final configuration.
 CHUNK_SIZE = 1000
@@ -600,7 +593,7 @@ def draft(question, subset):
 
 
 # --------------------------------------------------------------------------- #
-# Verification (Gemini)
+# Verification (OpenRouter)
 # --------------------------------------------------------------------------- #
 VERIFY_PROMPT = """You are a strict evidence-based evaluator of candidate answers.
 Use ONLY the supplied source passages. Do not use outside knowledge.
@@ -683,42 +676,114 @@ Return valid JSON only, with exactly these keys:
 {{"winner_index": 0, "reason": "Briefly explain the decisive evidence-based reason."}}
 """
 
-_gemini_lock = threading.Lock()
+_verify_lock = threading.Lock()
 _quota_exhausted = threading.Event()
 _last_call = 0.0
-MIN_INTERVAL = 13  # pacing for the configured Gemini free-tier rate limit
+MIN_INTERVAL = float(os.getenv("VERIFY_MIN_INTERVAL", "0"))  # optional pacing between calls (seconds)
+
+
+class VerifierHTTPError(Exception):
+    """An OpenRouter request failed; keeps the status code for error handling."""
+
+    def __init__(self, status, message, retry_after=None):
+        super().__init__(message)
+        self.status = status
+        self.retry_after = retry_after
 
 
 def wait_for_slot():
-    """Space Gemini calls and stop immediately if quota has been exhausted."""
+    """Optionally space verifier calls and stop immediately if credits are exhausted."""
     global _last_call
-    with _gemini_lock:
+    with _verify_lock:
         if _quota_exhausted.is_set():
-            raise RuntimeError("Gemini quota is exhausted; verification cannot continue.")
+            raise RuntimeError("Verifier quota is exhausted; verification cannot continue.")
         gap = time.time() - _last_call
         if gap < MIN_INTERVAL:
-            logger.debug("Waiting %.1fs to respect the Gemini rate limit", MIN_INTERVAL - gap)
+            logger.debug("Waiting %.1fs to respect the verifier rate limit", MIN_INTERVAL - gap)
             if _quota_exhausted.wait(MIN_INTERVAL - gap):
-                raise RuntimeError("Gemini quota is exhausted; verification cannot continue.")
+                raise RuntimeError("Verifier quota is exhausted; verification cannot continue.")
         _last_call = time.time()
 
 
-def _handle_gemini_error(error, attempt, retries, operation):
-    """Handle Gemini quota/model errors and back off before the next retry."""
+def _extract_json(text):
+    """Parse a JSON object from a model reply (tolerates code fences and extra prose)."""
+    if not text:
+        raise ValueError("Verifier returned an empty response")
+    text = re.sub(r"<think>.*?</think>", "", text, flags=re.DOTALL).strip()
+    text = re.sub(r"^```(?:json)?\s*|\s*```$", "", text).strip()
+    try:
+        return json.loads(text)
+    except json.JSONDecodeError:
+        match = re.search(r"\{.*\}", text, flags=re.DOTALL)
+        if not match:
+            raise ValueError(f"Verifier did not return JSON: {text[:200]!r}")
+        return json.loads(match.group(0))
+
+
+def call_verifier(prompt):
+    """Send one prompt to the OpenRouter model and return the parsed JSON reply."""
+    try:
+        response = requests.post(
+            OPENROUTER_CHAT_URL,
+            headers={
+                "Authorization": f"Bearer {VERIFY_API_KEY}",
+                "Content-Type": "application/json",
+            },
+            json={
+                "model": VERIFY_MODEL,
+                "messages": [{"role": "user", "content": prompt}],
+                "temperature": 0,
+                "response_format": {"type": "json_object"},
+            },
+            timeout=VERIFY_TIMEOUT,
+        )
+    except requests.RequestException as error:
+        raise VerifierHTTPError(None, f"network error: {error}") from error
+
+    if response.status_code != 200:
+        retry_after = response.headers.get("Retry-After")
+        raise VerifierHTTPError(
+            response.status_code,
+            response.text[:300],
+            float(retry_after) if retry_after and retry_after.replace(".", "", 1).isdigit() else None,
+        )
+    body = response.json()
+    if body.get("error"):  # OpenRouter can return an error object with HTTP 200
+        err = body["error"]
+        code = err.get("code") if isinstance(err, dict) else None
+        message = err.get("message") if isinstance(err, dict) else str(err)
+        raise VerifierHTTPError(code if isinstance(code, int) else None, str(message)[:300])
+    try:
+        content = body["choices"][0]["message"].get("content")
+    except (KeyError, IndexError, TypeError, AttributeError) as error:
+        raise ValueError(f"Unexpected OpenRouter response: {str(body)[:200]}") from error
+    return _extract_json(content)
+
+
+def _handle_verifier_error(error, attempt, retries, operation):
+    """Handle OpenRouter credit/model/auth errors and back off before the next retry."""
     msg = str(error)
-    if "RESOURCE_EXHAUSTED" in msg or "current quota" in msg.lower():
-        logger.error("Gemini quota exhausted during %s", operation)
+    status = getattr(error, "status", None)
+    if status == 402 or "insufficient credits" in msg.lower():
+        logger.error("OpenRouter credits exhausted during %s", operation)
         _quota_exhausted.set()
         raise RuntimeError(
-            f"Gemini quota is exhausted during {operation}. "
+            f"Verifier quota is exhausted during {operation} (OpenRouter credits). "
             "No unverified winner will be selected."
         ) from error
-    if "404" in msg or "NOT_FOUND" in msg:
-        logger.error("Gemini model %r was not found: %s", VERIFY_MODEL, msg[:200])
-        raise RuntimeError(f"Gemini model {VERIFY_MODEL!r} was not found: {msg}") from error
+    if status in (401, 403):
+        logger.error("OpenRouter rejected the api-key during %s: %s", operation, msg[:200])
+        _quota_exhausted.set()
+        raise RuntimeError(
+            f"Verifier quota is exhausted: OpenRouter rejected the api-key during {operation}: {msg}"
+        ) from error
+    if status == 404 or "no endpoints found" in msg.lower():
+        logger.error("Verifier model %r was not found: %s", VERIFY_MODEL, msg[:200])
+        raise RuntimeError(f"Verifier model {VERIFY_MODEL!r} was not found: {msg}") from error
 
-    match = re.search(r"retry in ([\d.]+)s", msg)
-    wait = float(match.group(1)) + 1 if match else 2 ** attempt
+    # 429 (rate limit), 5xx, timeouts and malformed replies are retried with backoff.
+    retry_after = getattr(error, "retry_after", None)
+    wait = (retry_after + 1) if retry_after else min(2 ** attempt, 30)
     if attempt + 1 < retries:
         logger.warning("%s failed (%s). Retrying in %.0fs", operation, msg[:200], wait)
         print(f"{operation} failed ({msg[:200]}). Retrying in {wait:.0f}s...")
@@ -726,7 +791,7 @@ def _handle_gemini_error(error, attempt, retries, operation):
 
 
 def _build_verification_inputs(drafts, subsets):
-    """Prepare the source documents and candidate data for Gemini scoring."""
+    """Prepare the source documents and candidate data for verifier scoring."""
     source_documents = []
     source_indexes = {}
     candidates = []
@@ -747,7 +812,7 @@ def _build_verification_inputs(drafts, subsets):
 
 
 def resolve_tie(question, source_documents, candidates, tied_indexes, retries=3):
-    """Ask Gemini to choose exactly one of the drafts tied for the highest score."""
+    """Ask the verifier to choose exactly one of the drafts tied for the highest score."""
     tied_candidates = [
         candidate for candidate in candidates
         if candidate["index"] in tied_indexes
@@ -761,15 +826,7 @@ def resolve_tie(question, source_documents, candidates, tied_indexes, retries=3)
     for attempt in range(retries):
         wait_for_slot()
         try:
-            response = gemini_client.models.generate_content(
-                model=VERIFY_MODEL,
-                contents=prompt,
-                config=types.GenerateContentConfig(
-                    response_mime_type="application/json",
-                    temperature=0,
-                ),
-            )
-            data = json.loads(response.text)
+            data = call_verifier(prompt)
             winner = data.get("winner_index")
             reason = str(data.get("reason", "")).strip()
             if isinstance(winner, bool) or not isinstance(winner, int):
@@ -779,11 +836,11 @@ def resolve_tie(question, source_documents, candidates, tied_indexes, retries=3)
                     f"Tie-breaker selected draft {winner}, which was not in the tied candidates"
                 )
             logger.info(
-                "Gemini resolved top-score tie among drafts %s: selected draft %d. Reason: %s",
+                "Verifier resolved top-score tie among drafts %s: selected draft %d. Reason: %s",
                 [i + 1 for i in tied_indexes], winner + 1, reason,
             )
             print(
-                f"  Gemini strict tie-break: selected Draft {winner + 1}. "
+                f"  Verifier strict tie-break: selected Draft {winner + 1}. "
                 f"Reason: {reason or 'No explanation returned.'}",
                 flush=True,
             )
@@ -792,14 +849,14 @@ def resolve_tie(question, source_documents, candidates, tied_indexes, retries=3)
             last_error = error
             if isinstance(error, RuntimeError):
                 raise
-            _handle_gemini_error(error, attempt, retries, "Gemini strict tie-break")
+            _handle_verifier_error(error, attempt, retries, "Verifier strict tie-break")
     raise RuntimeError(
-        f"Gemini strict tie-break failed after {retries} attempts: {last_error}"
+        f"Verifier strict tie-break failed after {retries} attempts: {last_error}"
     ) from last_error
 
 
 def verify(question, drafts, subsets, retries=5):
-    """Score drafts, then use a second Gemini call only if the top score is tied."""
+    """Score drafts, then use a second verifier call only if the top score is tied."""
     if not drafts:
         raise ValueError("Cannot verify an empty list of drafts")
     source_documents, candidates = _build_verification_inputs(drafts, subsets)
@@ -812,20 +869,12 @@ def verify(question, drafts, subsets, retries=5):
     for attempt in range(retries):
         wait_for_slot()
         try:
-            response = gemini_client.models.generate_content(
-                model=VERIFY_MODEL,
-                contents=prompt,
-                config=types.GenerateContentConfig(
-                    response_mime_type="application/json",
-                    temperature=0,
-                ),
-            )
-            data = json.loads(response.text)
+            data = call_verifier(prompt)
             scores = [float(score) for score in data["scores"]]
             if len(scores) != len(drafts) or any(
                 not np.isfinite(score) or score < 0 or score > 10 for score in scores
             ):
-                raise ValueError("Gemini returned invalid candidate scores")
+                raise ValueError("Verifier returned invalid candidate scores")
             top_score = max(scores)
             tied = [i for i, score in enumerate(scores) if score == top_score]
             if len(tied) == 1:
@@ -833,7 +882,7 @@ def verify(question, drafts, subsets, retries=5):
                 tie_reason = "No tie: selected the uniquely highest-scoring draft."
             else:
                 print(
-                    f"  Gemini scores are tied for drafts "
+                    f"  Verifier scores are tied for drafts "
                     f"{', '.join(str(i + 1) for i in tied)}. Requesting strict tie-break...",
                     flush=True,
                 )
@@ -841,7 +890,7 @@ def verify(question, drafts, subsets, retries=5):
                     question, source_documents, candidates, tied
                 )
             logger.debug(
-                "Gemini scores: %s, best draft: %d; tie decision: %s",
+                "Verifier scores: %s, best draft: %d; tie decision: %s",
                 scores, best + 1, tie_reason,
             )
             return scores, best, tie_reason, drafts[best]["answer"]
@@ -849,9 +898,9 @@ def verify(question, drafts, subsets, retries=5):
             last_error = error
             if isinstance(error, RuntimeError):
                 raise
-            _handle_gemini_error(error, attempt, retries, "Gemini verification")
+            _handle_verifier_error(error, attempt, retries, "Verifier verification")
     raise RuntimeError(
-        f"Gemini verification failed after {retries} attempts: {last_error}"
+        f"Verifier verification failed after {retries} attempts: {last_error}"
     ) from last_error
 
 
@@ -1011,8 +1060,8 @@ def answer_question(
     with ThreadPoolExecutor(max_workers=len(subsets)) as pool:
         drafts = list(pool.map(lambda subset: draft(question, subset), subsets))
 
-    logger.info("Comparing drafts with Gemini")
-    print("  Comparing drafts with Gemini...", flush=True)
+    logger.info("Comparing drafts with the verifier")
+    print("  Comparing drafts with the verifier...", flush=True)
     scores, best, tie_reason, final_answer = verify(question, drafts, subsets)
 
     for i, (draft_data, score, subset) in enumerate(zip(drafts, scores, subsets), start=1):
