@@ -18,19 +18,26 @@ import ollama
 from dotenv import load_dotenv
 from sklearn.cluster import KMeans
 
+try:
+    import tiktoken
+    _TOKEN_ENCODER = tiktoken.get_encoding("cl100k_base")
+except Exception:
+    _TOKEN_ENCODER = None
+
 HERE = Path(__file__).resolve()
 SESSION_DIR = HERE.parents[2]               # src/session3 (data folders and app.log live here)
+SESSION_DIR.mkdir(parents=True, exist_ok=True)
 SRC_DIR = HERE.parents[3]                   # src/ (holds the shared logging_config.py)
 if str(SRC_DIR) not in sys.path:
     sys.path.insert(0, str(SRC_DIR))
 
 try:
     from logging_config import setup_logging  # noqa: E402
-except ImportError:  # shared module not on the path (e.g. inside Docker): log to stdout
+except ImportError:  # shared module not on the path: log to stdout
     def setup_logging(session_dir):
         logging.basicConfig(
             level=logging.INFO,
-            format="%(asctime)s %(levelname)s %(name)s: %(message)s",
+            format="%(asctime)s | %(levelname)-8s | %(name)s | %(message)s",
         )
 
 setup_logging(SESSION_DIR)
@@ -83,8 +90,39 @@ DOCS_DIR.mkdir(exist_ok=True)
 if not any(DOCS_DIR.glob("*.pdf")):
     logger.warning("No PDFs found in %s yet. Upload one from the UI or drop it in the folder", DOCS_DIR)
 
-logger.info("Verifier model: %r", VERIFY_MODEL)
-print(f"Verifier model: {VERIFY_MODEL!r}")
+logger.info("Verifier model: %r | Draft model: %r", VERIFY_MODEL, DRAFT_MODEL)
+
+
+# --------------------------------------------------------------------------- #
+# Token Counting Helpers (Backend Logs + Docker Compose Logs Only)
+# --------------------------------------------------------------------------- #
+def _estimate_tokens(text):
+    """Count tokens using tiktoken if available, falling back to ~4 chars/token."""
+    if not text:
+        return 0
+    text_str = str(text)
+    if _TOKEN_ENCODER is not None:
+        return len(_TOKEN_ENCODER.encode(text_str))
+    return max(1, (len(text_str) + 3) // 4)
+
+
+def count_question_tokens(question):
+    """Calculate the token count of the user's question."""
+    return _estimate_tokens(question)
+
+
+def count_input_tokens(prompt_text, provider_tokens=None):
+    """Return exact provider prompt tokens when reported, otherwise estimate from prompt text."""
+    if isinstance(provider_tokens, int) and provider_tokens > 0:
+        return provider_tokens
+    return _estimate_tokens(prompt_text)
+
+
+def count_output_tokens(output_text, provider_tokens=None):
+    """Calculate the token count of the model output (prefers provider usage metrics if present)."""
+    if isinstance(provider_tokens, int) and provider_tokens > 0:
+        return provider_tokens
+    return _estimate_tokens(output_text)
 
 
 # --------------------------------------------------------------------------- #
@@ -185,6 +223,7 @@ def ingest_pdf(pdf_path, name=None, progress_callback=None):
         return "empty", 0
 
     total = len(chunks)
+    logger.info("[STAGE: INDEXING] Embedding and indexing %s (%d chunks)...", name, total)
     for start in range(0, total, EMBED_BATCH_SIZE):
         batch = chunks[start:start + EMBED_BATCH_SIZE]
         collection.add(
@@ -201,7 +240,6 @@ def ingest_pdf(pdf_path, name=None, progress_callback=None):
         if progress_callback:
             progress_callback(min(start + len(batch), total), total)
     logger.info("Indexed %s: %d chunks", name, total)
-    print(f"Indexed {name}: {total} chunks")
     return "added", total
 
 
@@ -216,17 +254,14 @@ def build_index():
         sample = collection.get(limit=1, include=["metadatas"])["metadatas"][0]
         if sample.get("embed_model") != EMBED_MODEL:
             logger.warning("Embedding model changed (or old index format). Rebuilding the index.")
-            print("Embedding model changed (or old index format). Rebuilding the index.")
             chromadb.PersistentClient(path=CHROMA_PATH).delete_collection(name="docs")
 
     for pdf_path in sorted(DOCS_DIR.glob("*.pdf")):
         status, _ = ingest_pdf(pdf_path)
         if status == "unchanged":
             logger.debug("%s: already indexed", pdf_path.name)
-            print(f"{pdf_path.name}: already indexed.")
         elif status == "empty":
             logger.warning("No text found in %s, skipping", pdf_path.name)
-            print(f"No text found in {pdf_path.name}, skipping.")
     return get_chroma_collection()
 
 
@@ -308,18 +343,13 @@ def cluster(embeddings, n_clusters=DEFAULT_N_CLUSTERS):
         return np.array([], dtype=int)
     n_clusters = max(1, min(n_clusters, len(embeddings)))
     logger.debug("Clustering %d embeddings into %d clusters", len(embeddings), n_clusters)
-    # n_init=10: K-Means is run 10 times with different starting centroids and
-    # the best result is kept.
     kmeans = KMeans(n_clusters=n_clusters, n_init=10, random_state=42)
     labels = kmeans.fit_predict(embeddings)
 
     actual_clusters = np.unique(labels)
     if len(actual_clusters) != n_clusters:
-        # Degenerate case (e.g. near-duplicate embeddings). build_subsets()
-        # copes with this by filling the missing slots from the other cluster.
         logger.warning(
-            "K-Means produced %d non-empty clusters, but %d were requested. "
-            "Subsets will be filled from the available clusters.",
+            "K-Means produced %d non-empty clusters, but %d were requested.",
             len(actual_clusters), n_clusters,
         )
     return labels
@@ -355,7 +385,6 @@ def _make_embedding_pair_schedule(
     norms = np.linalg.norm(vectors, axis=1, keepdims=True)
     normalized = vectors / np.maximum(norms, 1e-12)
 
-    # Convert Chroma cosine distances into a 0..1 relevance score.
     if distances is None:
         relevance = {idx: 1.0 - rank / max(size - 1, 1)
                      for rank, idx in enumerate(members)}
@@ -370,7 +399,6 @@ def _make_embedding_pair_schedule(
                 for idx in members
             }
 
-    # Start with the most relevant item, then grow a similarity-guided chain.
     first = members[0]
     remaining = set(members)
     remaining.remove(first)
@@ -396,10 +424,7 @@ def _make_embedding_pair_schedule(
         pairs.append([shared, next_idx])
         remaining.remove(next_idx)
 
-    # If the cluster cannot provide enough distinct pairs, cycle through
-    # the pairs already built rather than failing.
     return [pairs[i % len(pairs)] for i in range(n_subsets)]
-
 
 
 def build_subsets(
@@ -412,16 +437,6 @@ def build_subsets(
     """
     Build the evidence subsets for the drafts: four chunks per subset, two from
     each of the two K-Means clusters.
-
-    Each cluster is re-ranked by distance to the question, then a chain of
-    overlapping pairs is built from it ([A, B], [B, C], [C, D], ...). Every next
-    chunk is chosen by embedding similarity to the previous one (70%), with
-    question relevance as a secondary signal (30%). Neighbouring subsets share
-    evidence, while the set of subsets as a whole stays diverse.
-    Short clusters are supplemented from the other cluster/global relevance order.
-
-    If there are no more chunks than fit in one subset, a single subset holding
-    all of them is returned (extra drafts would only repeat the same evidence).
     """
     if len(docs) != len(labels):
         raise ValueError("The number of documents must match the number of cluster labels.")
@@ -443,25 +458,20 @@ def build_subsets(
         return [list(docs)]
 
     unique_labels = sorted(set(int(label) for label in labels))
-    # Group documents by cluster label, preserving their original retrieval order.
     cluster_members = {label: [] for label in unique_labels}
     for index, label in enumerate(labels):
         cluster_members[int(label)].append(index)
 
-    # Rerank each cluster's members by their distance to the question embedding.
     for label, indices in cluster_members.items():
         if distances is not None:
-            # Chroma cosine distance: smaller means more relevant to the question.
             indices.sort(key=lambda idx: (float(distances[idx]), idx))
         else:
-            # Chroma's retrieval result is already ordered by relevance.
             indices.sort()
         logger.info(
             "Cluster %d reranked chunk positions (1-based retrieval positions): %s",
             label, [index + 1 for index in indices],
         )
 
-    # Unpack the two clusters. If K-Means produced only one, the second is empty.
     first_label = unique_labels[0]
     first_members = cluster_members[first_label]
     if len(unique_labels) > 1:
@@ -478,35 +488,22 @@ def build_subsets(
         second_members, embeddings, distances, n_subsets
     )
 
-    # Global relevance order of all chunks (used as a last-resort filler).
     if distances is not None:
         global_rank = sorted(range(len(docs)), key=lambda idx: (float(distances[idx]), idx))
     else:
         global_rank = list(range(len(docs)))
 
-    # Rotate Cluster 2's pair schedule by two positions. This avoids always
-    # pairing the highest-ranked pair in Cluster 1 with the highest-ranked
-    # pair in Cluster 2.
     rotation = min(2, n_subsets - 1) if n_subsets > 1 else 0
 
-    # Iterate through each subset (draft) index to assemble final chunks
     subsets = []
     for subset_index in range(n_subsets):
         first_pair = first_schedule[subset_index]
-
-        # Apply rotation using modulus so it wraps around cleanly
         second_pair_index = (subset_index + rotation) % n_subsets
         second_pair = second_schedule[second_pair_index]
-
-        # Combine both picks into one index list
         selected_indices = first_pair + second_pair
 
-        # If a cluster could not supply two chunks, fill the remaining slots
-        # with the next most relevant unused chunks, preferring the cluster
-        # that is NOT short, then any remaining chunk by relevance.
         filler_added = []
         if len(selected_indices) < CHUNKS_PER_SUBSET:
-            # Pick the cluster that is not short.
             if len(first_pair) < CHUNKS_PER_CLUSTER_PER_SUBSET and len(second_pair) >= CHUNKS_PER_CLUSTER_PER_SUBSET:
                 preferred_members = second_members
             elif len(second_pair) < CHUNKS_PER_CLUSTER_PER_SUBSET and len(first_pair) >= CHUNKS_PER_CLUSTER_PER_SUBSET:
@@ -522,14 +519,12 @@ def build_subsets(
                         selected_indices.append(idx)
                         filler_added.append(idx)
 
-        # Safety check for duplicates / wrong size
         if len(set(selected_indices)) != CHUNKS_PER_SUBSET:
             raise ValueError(
                 "Could not build a four-chunk subset without duplicates. "
                 "Not enough distinct retrieved chunks."
             )
 
-        # Map the selected indices back to the actual document and stores them.
         subsets.append([docs[index] for index in selected_indices])
         logger.info(
             "Subset %d: Cluster %s retrieval positions %s; Cluster %s retrieval positions %s; "
@@ -569,18 +564,33 @@ If the documents do not contain the answer, say so in the answer.
 """
 
 
-def draft(question, subset):
+def draft(question, subset, draft_idx=None, token_tracker=None):
     """Generate one draft answer + rationale from a subset of documents."""
     docs_text = "\n\n".join(f"[{i}] {d}" for i, d in enumerate(subset, start=1))
     prompt = DRAFT_PROMPT.format(docs=docs_text, question=question)
-    logger.debug("Calling Ollama model %s with %d chunks", DRAFT_MODEL, len(subset))
+    label = f"Draft {draft_idx}" if draft_idx is not None else "Draft"
+    logger.debug("Calling Ollama model %s for %s with %d chunks", DRAFT_MODEL, label, len(subset))
+
+    started = time.perf_counter()
     res = ollama_client.chat(
         model=DRAFT_MODEL,
         messages=[{"role": "user", "content": prompt}],
         format="json",
         options={"temperature": 0, "num_predict": 768},
     )
+    elapsed = time.perf_counter() - started
     raw = res["message"]["content"]
+
+    in_tok = count_input_tokens(prompt, res.get("prompt_eval_count"))
+    out_tok = count_output_tokens(raw, res.get("eval_count"))
+    logger.info(
+        "[TOKENS | Ollama %s] %s finished in %.2fs | input_tokens=%d | output_tokens=%d",
+        DRAFT_MODEL, label, elapsed, in_tok, out_tok,
+    )
+    if token_tracker is not None:
+        token_tracker["ollama_input"] += in_tok
+        token_tracker["ollama_output"] += out_tok
+
     try:
         data = json.loads(raw)
         return {
@@ -588,7 +598,7 @@ def draft(question, subset):
             "rationale": str(data.get("rationale", "")),
         }
     except (json.JSONDecodeError, AttributeError):
-        logger.warning("Draft was not valid JSON, using the raw text instead")
+        logger.warning("%s was not valid JSON, using the raw text instead", label)
         return {"answer": raw, "rationale": ""}
 
 
@@ -624,8 +634,9 @@ Source passages (each unique passage appears once):
 Candidate drafts and the source passage indexes each draft saw:
 {candidates}
 
-Return JSON only in this shape:
-{{"scores": [8, 6, 4]}}
+Return JSON only, with exactly {n} scores (one per candidate, in the same order,
+each a number from 0 to 10), in this shape:
+{example}
 """
 
 TIE_BREAK_PROMPT = """You are the final decision-maker in a strict evidence-based
@@ -720,8 +731,9 @@ def _extract_json(text):
         return json.loads(match.group(0))
 
 
-def call_verifier(prompt):
+def call_verifier(prompt, stage_label="verify", token_tracker=None):
     """Send one prompt to the OpenRouter model and return the parsed JSON reply."""
+    started = time.perf_counter()
     try:
         response = requests.post(
             OPENROUTER_CHAT_URL,
@@ -740,6 +752,7 @@ def call_verifier(prompt):
     except requests.RequestException as error:
         raise VerifierHTTPError(None, f"network error: {error}") from error
 
+    elapsed = time.perf_counter() - started
     if response.status_code != 200:
         retry_after = response.headers.get("Retry-After")
         raise VerifierHTTPError(
@@ -757,6 +770,18 @@ def call_verifier(prompt):
         content = body["choices"][0]["message"].get("content")
     except (KeyError, IndexError, TypeError, AttributeError) as error:
         raise ValueError(f"Unexpected OpenRouter response: {str(body)[:200]}") from error
+
+    usage = body.get("usage") or {}
+    in_tok = count_input_tokens(prompt, usage.get("prompt_tokens"))
+    out_tok = count_output_tokens(content or "", usage.get("completion_tokens"))
+    logger.info(
+        "[TOKENS | OpenRouter %s] (%s) finished in %.2fs | input_tokens=%d | output_tokens=%d",
+        VERIFY_MODEL, stage_label, elapsed, in_tok, out_tok,
+    )
+    if token_tracker is not None:
+        token_tracker["openrouter_input"] += in_tok
+        token_tracker["openrouter_output"] += out_tok
+
     return _extract_json(content)
 
 
@@ -781,12 +806,10 @@ def _handle_verifier_error(error, attempt, retries, operation):
         logger.error("Verifier model %r was not found: %s", VERIFY_MODEL, msg[:200])
         raise RuntimeError(f"Verifier model {VERIFY_MODEL!r} was not found: {msg}") from error
 
-    # 429 (rate limit), 5xx, timeouts and malformed replies are retried with backoff.
     retry_after = getattr(error, "retry_after", None)
     wait = (retry_after + 1) if retry_after else min(2 ** attempt, 30)
     if attempt + 1 < retries:
         logger.warning("%s failed (%s). Retrying in %.0fs", operation, msg[:200], wait)
-        print(f"{operation} failed ({msg[:200]}). Retrying in {wait:.0f}s...")
         time.sleep(wait)
 
 
@@ -811,7 +834,7 @@ def _build_verification_inputs(drafts, subsets):
     return source_documents, candidates
 
 
-def resolve_tie(question, source_documents, candidates, tied_indexes, retries=3):
+def resolve_tie(question, source_documents, candidates, tied_indexes, retries=3, token_tracker=None):
     """Ask the verifier to choose exactly one of the drafts tied for the highest score."""
     tied_candidates = [
         candidate for candidate in candidates
@@ -826,7 +849,7 @@ def resolve_tie(question, source_documents, candidates, tied_indexes, retries=3)
     for attempt in range(retries):
         wait_for_slot()
         try:
-            data = call_verifier(prompt)
+            data = call_verifier(prompt, stage_label="tie-break", token_tracker=token_tracker)
             winner = data.get("winner_index")
             reason = str(data.get("reason", "")).strip()
             if isinstance(winner, bool) or not isinstance(winner, int):
@@ -839,11 +862,6 @@ def resolve_tie(question, source_documents, candidates, tied_indexes, retries=3)
                 "Verifier resolved top-score tie among drafts %s: selected draft %d. Reason: %s",
                 [i + 1 for i in tied_indexes], winner + 1, reason,
             )
-            print(
-                f"  Verifier strict tie-break: selected Draft {winner + 1}. "
-                f"Reason: {reason or 'No explanation returned.'}",
-                flush=True,
-            )
             return winner, reason
         except Exception as error:
             last_error = error
@@ -855,22 +873,32 @@ def resolve_tie(question, source_documents, candidates, tied_indexes, retries=3)
     ) from last_error
 
 
-def verify(question, drafts, subsets, retries=5):
+def verify(question, drafts, subsets, retries=5, token_tracker=None):
     """Score drafts, then use a second verifier call only if the top score is tied."""
     if not drafts:
         raise ValueError("Cannot verify an empty list of drafts")
     source_documents, candidates = _build_verification_inputs(drafts, subsets)
+    n = len(drafts)
     prompt = VERIFY_PROMPT.format(
         question=question,
         source_documents=json.dumps(source_documents, ensure_ascii=False),
         candidates=json.dumps(candidates, ensure_ascii=False),
+        n=n,
+        example='{"scores": [' + ", ".join(f"<score for candidate {i}>" for i in range(n)) + "]}",
     )
     last_error = None
     for attempt in range(retries):
         wait_for_slot()
         try:
-            data = call_verifier(prompt)
-            scores = [float(score) for score in data["scores"]]
+            attempt_prompt = prompt if attempt == 0 else (
+                prompt + f"\n\nYour previous reply was invalid. Return exactly {n} "
+                         f"numeric scores between 0 and 10 in a JSON list."
+            )
+            data = call_verifier(attempt_prompt, stage_label="scoring", token_tracker=token_tracker)
+            raw_scores = data["scores"]
+            if isinstance(raw_scores, dict):
+                raw_scores = [raw_scores[key] for key in sorted(raw_scores, key=lambda x: int(x))]
+            scores = [float(score) for score in raw_scores]
             if len(scores) != len(drafts) or any(
                 not np.isfinite(score) or score < 0 or score > 10 for score in scores
             ):
@@ -881,13 +909,12 @@ def verify(question, drafts, subsets, retries=5):
                 best = tied[0]
                 tie_reason = "No tie: selected the uniquely highest-scoring draft."
             else:
-                print(
-                    f"  Verifier scores are tied for drafts "
-                    f"{', '.join(str(i + 1) for i in tied)}. Requesting strict tie-break...",
-                    flush=True,
+                logger.info(
+                    "[STAGE 4/4: VERIFYING - TIE-BREAK] Scores tied for drafts %s; running tie-breaker...",
+                    [i + 1 for i in tied],
                 )
                 best, tie_reason = resolve_tie(
-                    question, source_documents, candidates, tied
+                    question, source_documents, candidates, tied, token_tracker=token_tracker
                 )
             logger.debug(
                 "Verifier scores: %s, best draft: %d; tie decision: %s",
@@ -907,8 +934,8 @@ def verify(question, drafts, subsets, retries=5):
 # --------------------------------------------------------------------------- #
 # Conversation memory: turn follow-up questions into standalone questions
 # --------------------------------------------------------------------------- #
-HISTORY_TURNS = 6          # how many recent messages (user + assistant) to consider
-HISTORY_CHARS = 600        # max characters kept from each earlier message
+HISTORY_TURNS = 6
+HISTORY_CHARS = 600
 
 REWRITE_PROMPT = """You rewrite follow-up questions so they can be understood without the chat.
 
@@ -933,11 +960,7 @@ Standalone question:"""
 
 
 def rewrite_question(question, history):
-    """
-    This function looks at the last 6 messages of the chat, it cuts each message at 600 chars so the prompt stays short,
-    it sends them to the local OLlama model with the new question, the model then replies with complete standalone question,
-    and the rewritten question is used for the whole search, instead of the original one.
-    """
+    """Rewrite a follow-up question into a standalone question using chat history."""
     if not history:
         return question
 
@@ -956,6 +979,7 @@ def rewrite_question(question, history):
         lines.append(f"{speaker}: {text}")
     prompt = REWRITE_PROMPT.format(history="\n".join(lines), question=question)
 
+    logger.info("[STAGE: REWRITING] Resolving follow-up question context with Ollama (%s)...", DRAFT_MODEL)
     try:
         res = ollama_client.chat(
             model=DRAFT_MODEL,
@@ -963,17 +987,104 @@ def rewrite_question(question, history):
             options={"temperature": 0, "num_predict": 768},
         )
         rewritten = " ".join(res["message"]["content"].split()).strip().strip('"')
+        in_tok = count_input_tokens(prompt, res.get("prompt_eval_count"))
+        out_tok = count_output_tokens(rewritten, res.get("eval_count"))
+        logger.info(
+            "[TOKENS | Ollama %s] Rewrite finished | input_tokens=%d | output_tokens=%d",
+            DRAFT_MODEL, in_tok, out_tok,
+        )
     except Exception:
         logger.exception("Question rewriting failed; using the original question")
         return question
 
-    # Reject empty or runaway rewrites (e.g. the model started answering instead).
     if not rewritten or len(rewritten) > max(300, 4 * len(question)):
         logger.warning("Discarding unusable rewrite: %r", rewritten[:120])
         return question
     if rewritten != question:
         logger.info("Question rewritten: %r -> %r", question, rewritten)
     return rewritten
+
+
+# --------------------------------------------------------------------------- #
+# Pipeline trace (chunks, clusters, subsets, drafts, final answer) -> INFO logs
+# Same layout as the trace in evaluate.py, so `docker compose logs backend` shows it.
+#   TRACE_PIPELINE=0      switch the trace off
+#   TRACE_CHUNK_CHARS=300 clip every chunk to N characters (default 0 = full text)
+# --------------------------------------------------------------------------- #
+TRACE_PIPELINE = os.getenv("TRACE_PIPELINE", "1").strip().lower() not in ("0", "false", "no", "off")
+try:
+    TRACE_CHUNK_CHARS = int(os.getenv("TRACE_CHUNK_CHARS", "0"))
+except ValueError:
+    TRACE_CHUNK_CHARS = 0
+
+
+def _trace_clip(text):
+    text = " ".join(str(text).split())
+    if TRACE_CHUNK_CHARS <= 0 or len(text) <= TRACE_CHUNK_CHARS:
+        return text
+    return text[:TRACE_CHUNK_CHARS].rstrip() + " ..."
+
+
+def _trace_ids(positions):
+    return " ".join(f"#{p}" for p in positions)
+
+
+def _trace_log(lines):
+    """One INFO record per section, so a section stays together even with concurrent requests."""
+    if TRACE_PIPELINE:
+        logger.info("%s", "\n".join(lines))
+
+
+def trace_retrieval(docs, metas, distances, k):
+    lines = [f"== RETRIEVED CHUNKS ({len(docs)} of k={k}, #1 = most similar) =="]
+    for i, doc in enumerate(docs, start=1):
+        dist = f"dist {float(distances[i - 1]):.3f}  " if distances is not None else ""
+        src = (metas[i - 1] or {}).get("source", "?") if metas else "?"
+        lines.append(f"#{i:<2} {dist}[{src}]")
+        lines.append(_trace_clip(doc))
+    _trace_log(lines)
+
+
+def trace_clusters(docs, labels):
+    lines = ["== K-MEANS CLUSTERS =="]
+    for label in sorted({int(x) for x in labels}):
+        members = [i for i, x in enumerate(labels, start=1) if int(x) == label]
+        lines.append(f"Cluster {label}  ({len(members)} chunks): {_trace_ids(members)}")
+        for i in members:
+            lines.append(f"    #{i:<2} {_trace_clip(docs[i - 1])}")
+    _trace_log(lines)
+
+
+def trace_subsets(docs, labels, subsets):
+    positions = [[docs.index(doc) + 1 for doc in subset] for subset in subsets]
+    lines = ["== SUBSETS =="]
+    for n, pos in enumerate(positions, start=1):
+        by_cluster = {}
+        for p in pos:
+            by_cluster.setdefault(int(labels[p - 1]), []).append(p)
+        detail = "; ".join(f"cluster {c}: {_trace_ids(v)}" for c, v in sorted(by_cluster.items()))
+        lines.append(f"Subset {n}: {_trace_ids(pos)}   ({detail})")
+        for p in pos:
+            lines.append(f"    #{p:<2} {_trace_clip(docs[p - 1])}")
+    used = {p for pos in positions for p in pos}
+    unused = [i for i in range(1, len(docs) + 1) if i not in used]
+    lines.append(f"Chunks used by at least one subset: {_trace_ids(sorted(used))}")
+    lines.append("Chunks NOT given to any draft: " + (_trace_ids(unused) if unused else "none"))
+    _trace_log(lines)
+    return positions
+
+
+def trace_generation(drafts, scores, best, positions, final_answer):
+    lines = ["== DRAFTS AND VERIFICATION =="]
+    for n, d in enumerate(drafts):
+        mark = "  <== selected" if n == best else ""
+        lines.append(f"Draft {n + 1}  (subset {n + 1}: {_trace_ids(positions[n])})  "
+                     f"verifier score {scores[n]}{mark}")
+        lines.append(f"    Answer   : {_trace_clip(d['answer'])}")
+        lines.append(f"    Rationale: {_trace_clip(d['rationale'])}")
+    _trace_log(lines)
+    # the final answer is always shown in full
+    _trace_log(["== FINAL ANSWER ==", " ".join(str(final_answer).split())])
 
 
 # --------------------------------------------------------------------------- #
@@ -987,34 +1098,40 @@ def answer_question(
     history=None,
     source=None,
 ):
-    """
-    Run the full pipeline. Returns (final_answer, list_of_source_file_names).
-
-    `history` (optional) is the earlier chat as a list of
-    {"role": ..., "content": ...} dicts. It is used only to turn a follow-up such
-    as "does it jump over you?" into a standalone question before retrieval.
-
-    `source` (optional) is the file name of one indexed PDF. When set, retrieval
-    is restricted to that document.
-    """
+    """Run the full pipeline. Returns (final_answer, list_of_source_file_names)."""
     if n_clusters != 2:
         raise ValueError(
             "The current overlapping-subsets strategy is designed for exactly 2 K-Means clusters."
         )
+
+    pipeline_start = time.perf_counter()
+    raw_q_tokens = count_question_tokens(question)
+    logger.info(
+        "[STAGE 0/4: START] Received question | question_tokens=%d | scope=%s",
+        raw_q_tokens, source or "all documents",
+    )
+
     original_question = question
     question = rewrite_question(question, history)
     if question != original_question:
-        print(f"  Follow-up understood as: {question}", flush=True)
+        rewritten_q_tokens = count_question_tokens(question)
+        logger.info(
+            "[STAGE 0/4: REWRITTEN] Follow-up understood as %r | rewritten_question_tokens=%d",
+            question, rewritten_q_tokens,
+        )
+
+    final_q_tokens = count_question_tokens(question)
+    token_tracker = {
+        "question_tokens": final_q_tokens,
+        "ollama_input": 0,
+        "ollama_output": 0,
+        "openrouter_input": 0,
+        "openrouter_output": 0,
+    }
+
     logger.info(
-        "Retrieving relevant chunks (k=%d); clusters=%d; subsets=%d",
-        k, n_clusters, n_subsets,
-    )
-    if source:
-        print(f"  Searching only in: {source}", flush=True)
-    print(
-        f"  Retrieving up to {k} relevant chunks, clustering into {n_clusters} groups, "
-        f"and preparing {n_subsets} overlapping subsets...",
-        flush=True,
+        "[STAGE 1/4: RETRIEVING] Embedding question (%d tokens) and searching ChromaDB for top-k=%d chunks (scope=%s)...",
+        final_q_tokens, k, source or "all documents",
     )
     docs, metas, embs, distances = retrieve(
         question, k=k, return_distances=True, source=source
@@ -1033,13 +1150,20 @@ def answer_question(
             "I'll be able to answer questions about it.",
             [],
         )
+
+    trace_retrieval(docs, metas, distances, k)
+
+    logger.info(
+        "[STAGE 2/4: CLUSTERING & SUBSETS] Retrieved %d chunks. Running K-Means (clusters=%d) and building %d overlapping subsets...",
+        len(docs), n_clusters, n_subsets,
+    )
     labels = cluster(embs, n_clusters=n_clusters)
     cluster_sizes = Counter(int(label) for label in labels)
-    print(
-        "  K-Means cluster sizes: "
-        + ", ".join(f"Cluster {label}: {size}" for label, size in sorted(cluster_sizes.items())),
-        flush=True,
+    logger.info(
+        "[STAGE 2/4: CLUSTERING & SUBSETS] K-Means cluster sizes: %s",
+        ", ".join(f"Cluster {label}: {size}" for label, size in sorted(cluster_sizes.items())),
     )
+    trace_clusters(docs, labels)
     subsets = build_subsets(
         docs,
         labels,
@@ -1047,37 +1171,57 @@ def answer_question(
         distances=distances,
         embeddings=embs,
     )
+    positions = trace_subsets(docs, labels, subsets)
 
     logger.info(
-        "Generating %d drafts with %d chunks per subset using Ollama",
-        len(subsets), len(subsets[0]),
-    )
-    print(
-        f"  Generating {len(subsets)} drafts with Ollama "
-        f"({len(subsets[0])} chunks per draft)...",
-        flush=True,
+        "[STAGE 3/4: DRAFTING] Generating %d drafts (%d chunks/subset) with Ollama (%s). "
+        "Please wait — this might take a few minutes depending on local hardware...",
+        len(subsets), len(subsets[0]), DRAFT_MODEL,
     )
     with ThreadPoolExecutor(max_workers=len(subsets)) as pool:
-        drafts = list(pool.map(lambda subset: draft(question, subset), subsets))
+        futures = [
+            pool.submit(draft, question, subset, i + 1, token_tracker)
+            for i, subset in enumerate(subsets)
+        ]
+        drafts = [f.result() for f in futures]
 
-    logger.info("Comparing drafts with the verifier")
-    print("  Comparing drafts with the verifier...", flush=True)
-    scores, best, tie_reason, final_answer = verify(question, drafts, subsets)
+    logger.info(
+        "[STAGE 4/4: VERIFYING] All %d drafts generated. Sending candidates to OpenRouter (%s) for verification and scoring...",
+        len(drafts), VERIFY_MODEL,
+    )
+    scores, best, tie_reason, final_answer = verify(
+        question, drafts, subsets, token_tracker=token_tracker
+    )
+
+    trace_generation(drafts, scores, best, positions, final_answer)
 
     for i, (draft_data, score, subset) in enumerate(zip(drafts, scores, subsets), start=1):
         logger.debug(
             "Draft %d (score %.1f) answer=%s | rationale=%s",
             i, score, draft_data["answer"], draft_data["rationale"],
         )
-        print(f"\n--- Draft {i} (score: {score:.1f}) ---")
-        print(f"Evidence chunks: {len(subset)}")
-        print(f"Answer: {draft_data['answer']}")
-        print(f"Rationale: {draft_data['rationale']}")
 
-    print(f"\nSelected Draft: {best + 1}")
-    print(f"Selection explanation: {tie_reason}")
+    final_answer_tokens = count_output_tokens(final_answer)
+    total_elapsed = time.perf_counter() - pipeline_start
     sources = list(dict.fromkeys(meta["source"] for meta in metas))
-    logger.info("Answer ready from sources: %s", sources)
+
+    logger.info(
+        "[STAGE: COMPLETE] Pipeline finished in %.2fs | Selected Draft %d (score=%.1f, reason=%s) | Sources: %s",
+        total_elapsed, best + 1, scores[best], tie_reason, sources,
+    )
+    logger.info(
+        "[TOKEN SUMMARY] question_tokens=%d | final_answer_tokens=%d | "
+        "Ollama (%s): input_tokens=%d, output_tokens=%d | "
+        "OpenRouter (%s): input_tokens=%d, output_tokens=%d",
+        token_tracker["question_tokens"],
+        final_answer_tokens,
+        DRAFT_MODEL,
+        token_tracker["ollama_input"],
+        token_tracker["ollama_output"],
+        VERIFY_MODEL,
+        token_tracker["openrouter_input"],
+        token_tracker["openrouter_output"],
+    )
     return final_answer, sources
 
 
@@ -1120,7 +1264,7 @@ if __name__ == "__main__":
             logger.info("Session ended by the user")
             break
         try:
-            logger.info("Question received (%d chars)", len(question))
+            logger.info("Question received (%d chars, %d tokens)", len(question), count_question_tokens(question))
             answer = speculative_rag(question, history=cli_history)
             print(f"\nFinal Answer: {answer}")
             cli_history.append({"role": "user", "content": question})

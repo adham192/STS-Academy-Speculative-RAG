@@ -212,12 +212,19 @@
     "required_concepts": [
       [
         "newly arrived citizens",
-        "newly arrived residents"
+        "newly arrived residents",
+        "recently moved citizens",
+        "recently moved residents"
       ],
       [
         "treated the same as other state citizens",
         "same as other citizens of the state",
-        "full citizens of the state immediately"
+        "full citizens of the state immediately", 
+        "treated the same as other", 
+        "treated like other citizens", 
+        "treated like other", 
+        "same as other state citizens", 
+        "like other citizens of that state"
       ]
     ]
   },
