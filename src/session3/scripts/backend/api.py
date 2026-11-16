@@ -63,7 +63,7 @@ class AskRequest(BaseModel):
 
 class AskResponse(BaseModel):
     answer: str
-    source: Literal["redis", "postgresql", "speculative_rag"]   # where the answer came from
+    source: Literal["redis", "postgresql", "speculative_rag", "direct"]   # where the answer came from
     documents: list[str] = []                                   # PDFs the answer is based on
 
 
