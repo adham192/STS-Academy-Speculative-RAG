@@ -5,7 +5,7 @@ For every question in the ground-truth file the script:
   1. retrieves the top-k chunks and clusters them with K-Means,
   2. builds the evidence subsets (embedding-guided overlapping chains),
   3. writes one draft per subset with the local Ollama model,
-  4. lets Gemini score the drafts (a second Gemini call breaks a tie for the top score),
+  4. lets the OpenRouter verifier score the drafts (a second call breaks a tie for the top score),
   5. runs a plain-RAG baseline once, using all retrieved chunks in one prompt.
 
 Reported metrics: final accuracy, oracle accuracy (any draft correct), subset hit
@@ -37,6 +37,7 @@ from Speculative_RAG import (  # noqa: E402
     build_subsets,
     draft,
     verify,
+    MIN_INTERVAL,
     DEFAULT_RETRIEVAL_K,
     DEFAULT_N_CLUSTERS,
     DEFAULT_N_SUBSETS,
@@ -89,7 +90,7 @@ def matches_item(text, item):
 
 
 def run_drafts_and_verification(question, subsets):
-    """Write one draft per subset with Ollama, then verify them with Gemini."""
+    """Write one draft per subset with Ollama, then verify them with the OpenRouter verifier."""
     with ThreadPoolExecutor(max_workers=len(subsets)) as pool:
         drafts = list(pool.map(lambda subset: draft(question, subset), subsets))
     scores, best, tie_reason, final_answer = verify(question, drafts, subsets)
@@ -262,11 +263,15 @@ def evaluate():
     print("Subset strategy: embedding-guided overlapping chains")
     print(f"Retrieval k={K}; clusters={DEFAULT_N_CLUSTERS}; subsets={N_SUBSETS}")
     print(
-        f"Gemini verification calls: {len(test_items)} to {2 * len(test_items)} "
-        "(one per question, plus one more whenever the top score is tied). "
-        "At a 13-second minimum interval, pacing alone may take "
-        f"{(len(test_items) - 1) * 13 / 60:.1f} to {(2 * len(test_items) - 1) * 13 / 60:.1f} minutes."
+        f"Verifier calls: {len(test_items)} to {2 * len(test_items)} "
+        "(one per question, plus one more whenever the top score is tied)."
     )
+    if MIN_INTERVAL > 0:
+        print(
+            f"At a {MIN_INTERVAL:g}-second minimum interval, pacing alone may take "
+            f"{(len(test_items) - 1) * MIN_INTERVAL / 60:.1f} to "
+            f"{(2 * len(test_items) - 1) * MIN_INTERVAL / 60:.1f} minutes."
+        )
 
     build_index()
     indexed = list_documents()
@@ -298,12 +303,12 @@ def evaluate():
             })
             error_text = str(error).lower()
             if any(token in error_text for token in (
-                "gemini quota is exhausted",
+                "verifier quota is exhausted",
                 "resource_exhausted",
-                "gemini model",
-                "gemini verification failed",
+                "verifier model",
+                "verifier verification failed",
             )):
-                print("Stopping: Gemini verification is unavailable or quota is exhausted.")
+                print("Stopping: verifier is unavailable or OpenRouter credits are exhausted.")
                 break
         if SLEEP_BETWEEN_QUESTIONS:
             time.sleep(SLEEP_BETWEEN_QUESTIONS)

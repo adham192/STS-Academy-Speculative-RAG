@@ -292,7 +292,7 @@ def settings_dialog():
     )
     n_subsets = st.slider(
         "Number of drafts compared", 2, 5, int(s["n_subsets"]),
-        help="How many draft answers the local model writes before Gemini picks the best one.",
+        help="How many draft answers the local model writes before the OpenRouter model picks the best one.",
     )
     show_sources = st.toggle("Show sources under answers", value=bool(s["show_sources"]))
 
