@@ -4,6 +4,7 @@ import json
 import logging
 import sys
 import hashlib
+import unicodedata
 from pathlib import Path
 from concurrent.futures import ThreadPoolExecutor
 import time
@@ -81,6 +82,7 @@ DEFAULT_N_CLUSTERS = 2
 DEFAULT_N_SUBSETS = 5
 CHUNKS_PER_CLUSTER_PER_SUBSET = 2
 CHUNKS_PER_SUBSET = 4
+ARABIC_CHUNKER_VERSION = "arabic-nfkc-v1"
 
 BASE_DIR = Path(__file__).resolve().parent
 CHROMA_PATH = str(SESSION_DIR / "chroma_db")
@@ -143,7 +145,7 @@ def extract_pdf(pdf_path):
     with pymupdf.open(pdf_path) as doc:
         for page in doc:
             for line in page.get_text().split("\n"):
-                line = line.strip()
+                line = unicodedata.normalize("NFKC", line).strip()
                 if not line or line.isdigit():
                     continue
                 if re.search(r"\.{4,}", line):
@@ -152,8 +154,48 @@ def extract_pdf(pdf_path):
     return "\n".join(lines)
 
 
+def _contains_arabic(text):
+    """Return whether text contains characters from the Arabic Unicode block."""
+    return any("\u0600" <= char <= "\u06ff" for char in text)
+
+
+def _split_arabic_text(text):
+    """Split Arabic text into bounded, overlapping chunks at natural boundaries."""
+    text = text.replace("\r\n", "\n").replace("\r", "\n")
+    text = re.sub(r"[ \t\f\v]+", " ", text).strip()
+    chunks = []
+    start = 0
+
+    while start < len(text):
+        end = min(start + CHUNK_SIZE, len(text))
+        if end < len(text):
+            floor = start + int(CHUNK_SIZE * 0.55)
+            punctuation = max(
+                text.rfind(mark, floor, end)
+                for mark in (".", "!", "?", "؟", "؛", "،", "\n")
+            )
+            whitespace = max(text.rfind(" ", floor, end), text.rfind("\n", floor, end))
+            boundary = punctuation if punctuation >= floor else whitespace
+            if boundary >= floor:
+                end = boundary + 1
+
+        chunk = text[start:end].strip()
+        if chunk:
+            chunks.append(chunk)
+        if end >= len(text):
+            break
+        start = max(end - OVERLAP, start + 1)
+
+    return chunks
+
+
 def split_text_to_chunks(text):
-    """Split text into whole-sentence chunks with overlap."""
+    """Split text into bounded chunks, using Arabic-aware boundaries when needed."""
+    text = unicodedata.normalize("NFKC", text)
+    if _contains_arabic(text):
+        return _split_arabic_text(text)
+
+    # Keep the established English sentence chunking behavior unchanged.
     sentences = re.split(r"(?<=[.!?])\s+(?=[A-Z])", text)
     chunks, current, length = [], [], 0
 
@@ -176,7 +218,7 @@ def get_embeddings(texts):
     vectors = []
     logger.debug("Embedding %d texts through OpenRouter", len(texts))
     for i in range(0, len(texts), EMBED_BATCH_SIZE):
-        batch = texts[i:i + EMBED_BATCH_SIZE]
+        batch = [unicodedata.normalize("NFKC", text) for text in texts[i:i + EMBED_BATCH_SIZE]]
         response = requests.post(
             "https://openrouter.ai/api/v1/embeddings",
             headers={"Authorization": f"Bearer {OPENROUTER_API_KEY}"},
@@ -210,14 +252,25 @@ def ingest_pdf(pdf_path, name=None, progress_callback=None):
     name = name or os.path.basename(pdf_path)
     file_hash = file_sha256(pdf_path)
     collection = get_chroma_collection()
+    text = extract_pdf(pdf_path)
+    chunker_version = ARABIC_CHUNKER_VERSION if _contains_arabic(text) else "legacy"
 
-    if collection.get(where={"file_hash": file_hash}, limit=1)["ids"]:
+    existing = collection.get(
+        where={"$and": [{"source": name}, {"file_hash": file_hash}]},
+        limit=1,
+        include=["metadatas"],
+    )
+    existing_versions = [
+        metadata.get("chunker_version", "legacy")
+        for metadata in existing.get("metadatas", [])
+    ]
+    if existing["ids"] and all(version == chunker_version for version in existing_versions):
         logger.debug("%s is unchanged, skipping", name)
         return "unchanged", 0
 
     collection.delete(where={"source": name})
 
-    chunks = split_text_to_chunks(extract_pdf(pdf_path))
+    chunks = split_text_to_chunks(text)
     if not chunks:
         logger.warning("No text could be extracted from %s", name)
         return "empty", 0
@@ -233,6 +286,7 @@ def ingest_pdf(pdf_path, name=None, progress_callback=None):
                 "source": name,
                 "file_hash": file_hash,
                 "embed_model": EMBED_MODEL,
+                "chunker_version": chunker_version,
             }] * len(batch),
             ids=[f"{file_hash[:16]}_{start + j}" for j in range(len(batch))],
         )
