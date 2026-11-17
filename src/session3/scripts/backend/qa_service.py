@@ -52,9 +52,28 @@ _SMALL_TALK_REPLIES = {
 }
 
 
+def _edit_distance(left, right):
+    """Return the minimum number of single-character edits between two strings."""
+    previous = list(range(len(right) + 1))
+
+    for i, left_char in enumerate(left, start=1):
+        current = [i]
+        for j, right_char in enumerate(right, start=1):
+            current.append(min(
+                current[-1] + 1,                   # insert
+                previous[j] + 1,                   # delete
+                previous[j - 1] + (left_char != right_char),  # replace
+            ))
+        previous = current
+
+    return previous[-1]
+
+
 def _small_talk_reply(question):
     """Return a quick, document-free reply for recognized small-talk phrases."""
     normalized = normalize_question(question)
+
+    # First keep the existing exact matches.
     reply = _SMALL_TALK_REPLIES.get(normalized)
     if reply:
         return reply
@@ -66,6 +85,26 @@ def _small_talk_reply(question):
         return _SMALL_TALK_REPLIES["hey"]
     if re.fullmatch(r"hell+o+", normalized):
         return _SMALL_TALK_REPLIES["hello"]
+
+    # For a one-word message of 3–8 letters, accept a clear one-character typo
+    # in a short greeting such as "helo" → "hello" or "yello" → "hello".
+    if re.fullmatch(r"[a-z]{3,8}", normalized):
+        candidates = [
+            (phrase, response)
+            for phrase, response in _SMALL_TALK_REPLIES.items()
+            if " " not in phrase and phrase.isascii() and phrase.isalpha()
+        ]
+        matches = [
+            (phrase, response)
+            for phrase, response in candidates
+            if _edit_distance(normalized, phrase) == 1
+        ]
+
+        # Only use the correction when it points to one distinct reply.
+        distinct_replies = {response for _, response in matches}
+        if len(distinct_replies) == 1:
+            return distinct_replies.pop()
+
     return None
 
 
