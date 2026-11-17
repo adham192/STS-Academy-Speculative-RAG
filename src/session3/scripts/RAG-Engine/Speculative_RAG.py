@@ -126,6 +126,34 @@ def count_output_tokens(output_text, provider_tokens=None):
 
 
 # --------------------------------------------------------------------------- #
+# Cost calculation (OpenRouter verifier only; Ollama runs locally, so it is free)
+# Prices are USD per 1,000,000 tokens. Defaults are for qwen3.7-flash; override in .env.
+# --------------------------------------------------------------------------- #
+def _price_from_env(name, default):
+    try:
+        return float(os.getenv(name, default))
+    except ValueError:
+        return float(default)
+
+
+OPENROUTER_INPUT_PRICE_PER_M = _price_from_env("OPENROUTER_INPUT_PRICE_PER_M", "0.03")
+OPENROUTER_OUTPUT_PRICE_PER_M = _price_from_env("OPENROUTER_OUTPUT_PRICE_PER_M", "0.13")
+
+
+def calculate_cost(input_tokens, output_tokens,
+                   input_price_per_m=OPENROUTER_INPUT_PRICE_PER_M,
+                   output_price_per_m=OPENROUTER_OUTPUT_PRICE_PER_M):
+    """Return (input_cost, output_cost, total_cost) in dollars.
+
+    cost = (tokens / 1,000,000) * price per 1M tokens, computed separately for
+    input and output and then added together.
+    """
+    input_cost = (input_tokens / 1_000_000) * input_price_per_m
+    output_cost = (output_tokens / 1_000_000) * output_price_per_m
+    return input_cost, output_cost, input_cost + output_cost
+
+
+# --------------------------------------------------------------------------- #
 # Indexing
 # --------------------------------------------------------------------------- #
 def get_chroma_collection():
@@ -1221,6 +1249,19 @@ def answer_question(
         VERIFY_MODEL,
         token_tracker["openrouter_input"],
         token_tracker["openrouter_output"],
+    )
+
+    input_cost, output_cost, total_cost = calculate_cost(
+        token_tracker["openrouter_input"], token_tracker["openrouter_output"]
+    )
+    logger.info(
+        "[COST SUMMARY] OpenRouter (%s): input $%.8f (%d tokens x $%.2f/1M) | "
+        "output $%.8f (%d tokens x $%.2f/1M) | TOTAL $%.8f | Ollama (%s): $0.00 (local)",
+        VERIFY_MODEL,
+        input_cost, token_tracker["openrouter_input"], OPENROUTER_INPUT_PRICE_PER_M,
+        output_cost, token_tracker["openrouter_output"], OPENROUTER_OUTPUT_PRICE_PER_M,
+        total_cost,
+        DRAFT_MODEL,
     )
     return final_answer, sources
 
