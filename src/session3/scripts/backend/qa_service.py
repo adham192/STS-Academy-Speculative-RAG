@@ -4,6 +4,7 @@ The pipeline itself (Speculative_RAG.answer_question) is called unchanged.
 """
 
 import logging
+import re
 import threading
 from contextlib import contextmanager
 from dataclasses import dataclass, field
@@ -17,6 +18,94 @@ logger = logging.getLogger("backend.qa")
 SOURCE_REDIS = "redis"
 SOURCE_POSTGRES = "postgresql"
 SOURCE_PIPELINE = "speculative_rag"
+SOURCE_DIRECT = "direct"
+
+
+_SMALL_TALK_REPLIES = {
+    "hello": "Hello! How can I help you?",
+    "hi": "Hello! How can I help you?",
+    "hey": "Hey! How can I help you?",
+    "hiya": "Hey! How can I help you?",
+    "good morning": "Good morning! How can I help you?",
+    "good afternoon": "Good afternoon! How can I help you?",
+    "good evening": "Good evening! How can I help you?",
+    "how are you": "I'm doing well, thanks! How can I help you?",
+    "how are you doing": "I'm doing well, thanks! How can I help you?",
+    "how is it going": "Pretty well, thanks! How can I help you?",
+    "how's it going": "Pretty well, thanks! How can I help you?",
+    "whats up": "Not much! How can I help you?",
+    "what's up": "Not much! How can I help you?",
+    "thank you": "You're welcome!",
+    "thanks": "You're welcome!",
+    "goodbye": "Goodbye! Have a great day.",
+    "bye": "Goodbye! Have a great day.",
+    "hallo": "Hallo! Wie kann ich dir helfen?",
+    "guten morgen": "Guten Morgen! Wie kann ich dir helfen?",
+    "guten tag": "Guten Tag! Wie kann ich dir helfen?",
+    "guten abend": "Guten Abend! Wie kann ich dir helfen?",
+    "wie geht es dir": "Mir geht's gut, danke! Wie kann ich dir helfen?",
+    "wie gehts dir": "Mir geht's gut, danke! Wie kann ich dir helfen?",
+    "wie geht's": "Mir geht's gut, danke! Wie kann ich dir helfen?",
+    "danke": "Gern geschehen!",
+    "tschuss": "Tschüss! Hab einen schönen Tag.",
+    "auf wiedersehen": "Auf Wiedersehen!",
+}
+
+
+def _edit_distance(left, right):
+    """Return the minimum number of single-character edits between two strings."""
+    previous = list(range(len(right) + 1))
+
+    for i, left_char in enumerate(left, start=1):
+        current = [i]
+        for j, right_char in enumerate(right, start=1):
+            current.append(min(
+                current[-1] + 1,                   # insert
+                previous[j] + 1,                   # delete
+                previous[j - 1] + (left_char != right_char),  # replace
+            ))
+        previous = current
+
+    return previous[-1]
+
+
+def _small_talk_reply(question):
+    """Return a quick, document-free reply for recognized small-talk phrases."""
+    normalized = normalize_question(question)
+
+    # First keep the existing exact matches.
+    reply = _SMALL_TALK_REPLIES.get(normalized)
+    if reply:
+        return reply
+
+    # Accept common stretched spellings such as "hii", "heyyy", and "hellooo".
+    if re.fullmatch(r"h+i+", normalized):
+        return _SMALL_TALK_REPLIES["hi"]
+    if re.fullmatch(r"he+y+", normalized):
+        return _SMALL_TALK_REPLIES["hey"]
+    if re.fullmatch(r"hell+o+", normalized):
+        return _SMALL_TALK_REPLIES["hello"]
+
+    # For a one-word message of 3–8 letters, accept a clear one-character typo
+    # in a short greeting such as "helo" → "hello" or "yello" → "hello".
+    if re.fullmatch(r"[a-z]{3,8}", normalized):
+        candidates = [
+            (phrase, response)
+            for phrase, response in _SMALL_TALK_REPLIES.items()
+            if " " not in phrase and phrase.isascii() and phrase.isalpha()
+        ]
+        matches = [
+            (phrase, response)
+            for phrase, response in candidates
+            if _edit_distance(normalized, phrase) == 1
+        ]
+
+        # Only use the correction when it points to one distinct reply.
+        distinct_replies = {response for _, response in matches}
+        if len(distinct_replies) == 1:
+            return distinct_replies.pop()
+
+    return None
 
 
 @dataclass
@@ -68,6 +157,10 @@ class QAService:
     def ask(self, question, history=None, document=None, top_k=20, n_subsets=5) -> Answer:
         question = question.strip()
         scope = document or ""
+
+        direct_reply = _small_talk_reply(question)
+        if direct_reply:
+            return Answer(direct_reply, SOURCE_DIRECT)
 
         # Follow-ups ("what about it?") only make sense with the chat, so they are keyed on
         # the *standalone* rewrite. rewrite_question() returns the original text when it
