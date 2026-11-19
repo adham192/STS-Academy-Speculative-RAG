@@ -52,6 +52,12 @@ except ImportError:  # shared module not on the path (e.g. inside Docker): log t
 setup_logging(SESSION_DIR)
 logger = logging.getLogger("app")
 
+
+def _log_text(text, limit=2000):
+    """Cut long text so each question/answer stays one reasonable log line."""
+    text = str(text)
+    return text if len(text) <= limit else f"{text[:limit]}... [+{len(text) - limit} chars]"
+
 import api_client  # noqa: E402  (HTTP client for the backend API)
 
 HISTORY_PATH = SESSION_DIR / "JSON-chat-history" / "chat_history.json"
@@ -292,7 +298,7 @@ def settings_dialog():
     )
     n_subsets = st.slider(
         "Number of drafts compared", 2, 5, int(s["n_subsets"]),
-        help="How many draft answers the local model writes before the OpenRouter model picks the best one.",
+        help="How many chain-overlapping evidence subsets are drafted and compared by the verifier.",
     )
     show_sources = st.toggle("Show sources under answers", value=bool(s["show_sources"]))
 
@@ -467,7 +473,7 @@ for message_index, message in enumerate(messages):
 
 question = st.chat_input("Type your message here...")
 if question and question.strip():
-    logger.info("Question received in chat %s (%d chars)", ss.chat_id, len(question))
+    logger.info("Question received in chat %s (%d chars) | question=%r", ss.chat_id, len(question), _log_text(question))
     chat = ss.chats.setdefault(
         ss.chat_id,
         {"title": question.strip()[:60], "created": now_iso(), "updated": now_iso(), "messages": []},
@@ -505,7 +511,10 @@ if question and question.strip():
                     st.caption("Sources · " + " · ".join(map(str, sources)))
         messages.append({"role": "assistant", "content": answer, "sources": sources, "origin": origin})
         answered = True
-        logger.info("Answer ready from %s (%d chars, %d sources)", origin, len(answer), len(sources or []))
+        logger.info(
+            "Answer ready from %s (%d chars, %d sources) | answer=%r",
+            origin, len(answer), len(sources or []), _log_text(answer),
+        )
     except api_client.ApiError as exc:
         logger.error("The backend could not answer: %s", exc)
         st.error(f"The RAG system could not answer: {exc}")

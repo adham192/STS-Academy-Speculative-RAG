@@ -5,13 +5,10 @@ services:
     build:
       context: .
       target: backend
-    env_file: .env                      # provider keys/models (api-key, model, OLLAMA_HOST, ...)
+    env_file: .env                      # OpenRouter API keys and model configuration
     environment:                        # these override the localhost values from .env
       DATABASE_URL: ${DOCKER_DATABASE_URL:?set DOCKER_DATABASE_URL in .env}
       REDIS_URL: ${DOCKER_REDIS_URL:?set DOCKER_REDIS_URL in .env}
-      OLLAMA_HOST: ${DOCKER_OLLAMA_HOST:-http://host.docker.internal:11434}
-    extra_hosts:
-      - "host.docker.internal:host-gateway"   # reach Ollama running on the host (Linux too)
     ports:
       - "8000:8000"
     volumes:

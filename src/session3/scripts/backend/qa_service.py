@@ -6,12 +6,13 @@ The pipeline itself (Speculative_RAG.answer_question) is called unchanged.
 import logging
 import re
 import threading
+import time
 from contextlib import contextmanager
 from dataclasses import dataclass, field
 
 import cache
 import database
-from text_utils import normalize_question, question_hash
+from text_utils import clip_for_log, normalize_question, question_hash
 
 logger = logging.getLogger("backend.qa")
 
@@ -155,11 +156,17 @@ class QAService:
 
     # -- main entry --------------------------------------------------------- #
     def ask(self, question, history=None, document=None, top_k=20, n_subsets=5) -> Answer:
+        started = time.perf_counter()
         question = question.strip()
         scope = document or ""
+        logger.info(
+            "[QA] Question received | scope=%s | question=%r",
+            scope or "all documents", clip_for_log(question),
+        )
 
         direct_reply = _small_talk_reply(question)
         if direct_reply:
+            logger.info("[QA] Answered directly (small talk, no cache) | answer=%r", direct_reply)
             return Answer(direct_reply, SOURCE_DIRECT)
 
         # Follow-ups ("what about it?") only make sense with the chat, so they are keyed on
@@ -174,11 +181,18 @@ class QAService:
 
         normalized = normalize_question(standalone)
         q_hash = question_hash(normalized, scope)
+        logger.info(
+            "[QA] Cache lookup | key=%s | cacheable=%s | standalone_question=%r",
+            q_hash[:12], cacheable, clip_for_log(standalone),
+        )
 
         if cacheable:
             hit = self._lookup(q_hash)
             if hit:
-                logger.info("Answered from %s (%s)", hit.source, q_hash[:12])
+                logger.info(
+                    "[QA] Answered from %s | key=%s | %.2fs",
+                    hit.source, q_hash[:12], time.perf_counter() - started,
+                )
                 return hit
 
         def run_pipeline():
@@ -189,13 +203,23 @@ class QAService:
             return Answer(answer, SOURCE_PIPELINE, list(sources))
 
         if not cacheable:
+            logger.info("[QA] Follow-up not cacheable, running the pipeline | key=%s", q_hash[:12])
             return run_pipeline()
 
         with self._flight.lock(q_hash):
             hit = self._lookup(q_hash)  # another request may have finished while we waited
             if hit:
+                logger.info(
+                    "[QA] Answered from %s after waiting for an identical request | key=%s | %.2fs",
+                    hit.source, q_hash[:12], time.perf_counter() - started,
+                )
                 return hit
+            logger.info("[QA] Not in Redis or PostgreSQL, running the pipeline | key=%s", q_hash[:12])
             result = run_pipeline()
+            logger.info(
+                "[QA] Pipeline finished | key=%s | %.2fs | documents=%s",
+                q_hash[:12], time.perf_counter() - started, result.documents,
+            )
             # Fixed "no documents indexed" / "document not found" replies have no sources;
             # they describe the current state of the index, not an answer worth keeping.
             if result.documents:

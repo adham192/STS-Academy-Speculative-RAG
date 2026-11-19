@@ -1,54 +1,77 @@
-# Rebalance comparison: Speculative RAG with vs without `rebalance_clusters()`
+# Evaluation: Subset strategies vs Plain RAG
 
-Questions completed: **1** of 1 | retrieval k = 8 | clusters = 2 | min cluster size = 4 | subsets = 5
+Questions completed: **9** of 12 | retrieval k = 20 | clusters = 2 | subsets = 5 | strategies = chain, mmr, centroid, bridge
 
-## 1. How often does rebalancing matter?
+## 1. Overall results (all questions)
 
-- Questions where rebalancing changed the K-Means labels: **1 / 1**
-- Questions where it changed the subsets given to the drafts: **1 / 1**
-- On the remaining questions both variants get identical evidence, so they cannot differ.
+| System | Final acc. | Oracle | Subset hit | Concept recall | Best-subset cov. | Distinct chunks | Subset overlap | Avg sec |
+|---|---|---|---|---|---|---|---|---|
+| Speculative RAG [chain] | 66.7% | 66.7% | 77.8% | 77.8% | 92.6% | 11.7 | 0.14 | 217.8 |
+| Speculative RAG [mmr] | 44.4% | 66.7% | 77.8% | 72.8% | 92.6% | 11.7 | 0.14 | 177.3 |
+| Speculative RAG [centroid] | 44.4% | 44.4% | 77.8% | 72.8% | 92.6% | 11.7 | 0.14 | 176.3 |
+| Speculative RAG [bridge] | 44.4% | 44.4% | 77.8% | 74.3% | 92.6% | 13.3 | 0.14 | 199.9 |
+| Plain RAG (baseline) | 44.4% | - | - | 50.0% | - | - | - | 62.3 |
 
-| ID | Level | Raw sizes | Rebalanced sizes | Subsets changed |
+Retrieval MRR: **0.448**
+
+## 2. Accuracy by difficulty
+
+| Level | Speculative [chain] | Speculative [mmr] | Speculative [centroid] | Speculative [bridge] | Plain RAG |
+|---|---|---|---|---|---|
+| Easy (4) | 100.0% | 100.0% | 100.0% | 100.0% | 75.0% |
+| Medium (1) | 0.0% | 0.0% | 0.0% | 0.0% | 0.0% |
+| Hard (4) | 50.0% | 0.0% | 0.0% | 0.0% | 25.0% |
+
+## 3. Head-to-head vs Plain RAG (final answer correct)
+
+| Strategy | Speculative better | Plain RAG better | Same outcome | Exact sign test p |
 |---|---|---|---|---|
-| H03 | hard | 3/5 | 4/4 | yes |
+| chain | 2 | 0 | 7 | 0.500 |
+| mmr | 1 | 1 | 7 | 1.000 |
+| centroid | 1 | 1 | 7 | 1.000 |
+| bridge | 1 | 1 | 7 | 1.000 |
 
-## 2. Overall results (all questions)
+## 4. Strategy vs strategy (final answer correct)
 
-| System | Final acc. | Oracle | Subset hit | Concept recall | Best-subset cov. | Distinct chunks | Subset overlap | Avg sec |
-|---|---|---|---|---|---|---|---|---|
-| Without rebalance | 0.0% | 100.0% | 100.0% | 0.0% | 100.0% | 8.0 | 0.36 | 149.6 |
-| With rebalance | 0.0% | 0.0% | 100.0% | 0.0% | 100.0% | 8.0 | 0.36 | 155.0 |
-| Plain RAG (reference) | 0.0% | - | - | 0.0% | - | - | - | 67.2 |
+| Comparison | First better | Second better | Same outcome | Exact sign test p | Concept recall (first / second) | Questions with identical subsets |
+|---|---|---|---|---|---|---|
+| chain vs mmr | 2 | 0 | 7 | 0.500 | 77.8% / 72.8% | 0 of 9 |
+| chain vs centroid | 2 | 0 | 7 | 0.500 | 77.8% / 72.8% | 0 of 9 |
+| chain vs bridge | 2 | 0 | 7 | 0.500 | 77.8% / 74.3% | 0 of 9 |
+| mmr vs centroid | 0 | 0 | 9 | 1.000 | 72.8% / 72.8% | 0 of 9 |
+| mmr vs bridge | 0 | 0 | 9 | 1.000 | 72.8% / 74.3% | 0 of 9 |
+| centroid vs bridge | 0 | 0 | 9 | 1.000 | 72.8% / 74.3% | 0 of 9 |
 
-Retrieval MRR (identical for both variants): **0.250**
-
-## 3. Accuracy by difficulty
-
-| Level | Without rebalance | With rebalance | Plain RAG |
-|---|---|---|---|
-| Hard (1) | 0.0% | 0.0% | 0.0% |
-
-## 4. Head-to-head (final answer correct)
-
-| Rebalance better | Without better | Same outcome | Exact sign test p |
-|---|---|---|---|
-| 0 | 0 | 1 | 1.000 |
-
-### Only the 1 question(s) where the subsets differed
-
-| System | Final acc. | Oracle | Subset hit | Concept recall | Best-subset cov. | Distinct chunks | Subset overlap | Avg sec |
-|---|---|---|---|---|---|---|---|---|
-| Without rebalance | 0.0% | 100.0% | 100.0% | 0.0% | 100.0% | 8.0 | 0.36 | 149.6 |
-| With rebalance | 0.0% | 0.0% | 100.0% | 0.0% | 100.0% | 8.0 | 0.36 | 155.0 |
+_Questions where two strategies built identical subsets reuse the same drafts, so they can never count as a win for either side._
 
 ## 5. Per-question results
 
-| ID | Level | Raw sizes | Rebal. sizes | Subsets differ | Without | With | Plain RAG |
+| ID | Level | Cluster sizes | chain | mmr | centroid | bridge | Plain RAG |
 |---|---|---|---|---|---|---|---|
-| H03 | hard | 3/5 | 4/4 | yes | ✗ | ✗ | ✗ |
+| E01 | easy | 10/10 | ✓ | ✓ | ✓ | ✓ | ✓ |
+| E02 | easy | 16/4 | ✓ | ✓ | ✓ | ✓ | ✓ |
+| E03 | easy | 14/6 | ✓ | ✓ | ✓ | ✓ | ✗ |
+| E04 | easy | 9/11 | ✓ | ✓ | ✓ | ✓ | ✓ |
+| M01 | medium | 15/5 | ✗ | ✗ | ✗ | ✗ | ✗ |
+| H01 | hard | 9/11 | ✓ | ✗ | ✗ | ✗ | ✗ |
+| H02 | hard | 7/13 | ✗ | ✗ | ✗ | ✗ | ✗ |
+| H03 | hard | 13/7 | ✗ | ✗ | ✗ | ✗ | ✗ |
+| H04 | hard | 9/11 | ✓ | ✗ | ✗ | ✗ | ✓ |
 
-## 6. Reading the results
+## 6. Subset structure
 
-Final accuracy is tied (0.0%); compare concept recall, oracle accuracy and subset diversity above for secondary differences.
+| Strategy | Distinct chunks used | Subset overlap (Jaccard) | Intra-subset similarity (lower = less repeated) | Mean chunk distance (lower = closer to question) |
+|---|---|---|---|---|
+| chain | 11.7 | 0.14 | 0.704 | 0.368 |
+| mmr | 11.7 | 0.14 | 0.689 | 0.367 |
+| centroid | 11.7 | 0.14 | 0.695 | 0.367 |
+| bridge | 13.3 | 0.14 | 0.692 | 0.371 |
 
-Caveats: the question set is small, so one question moves accuracy by several percentage points and the sign test rarely reaches significance. Scores use phrase matching, so check the saved answers for correct paraphrases. A difference only appears on questions where K-Means produced a cluster with fewer than 4 chunks.
+## 7. Reading the results
+
+- **chain**: final accuracy 66.7%, concept recall 77.8%.
+- **mmr**: final accuracy 44.4%, concept recall 72.8%.
+- **centroid**: final accuracy 44.4%, concept recall 72.8%.
+- **bridge**: final accuracy 44.4%, concept recall 74.3%.
+- Highest final accuracy: **chain**.
+- With 9 questions, a gap of one or two questions is within noise (the drafts come from an LLM and are not perfectly repeatable). Trust the sign-test p-values in the strategy-vs-strategy table, not the raw percentages.

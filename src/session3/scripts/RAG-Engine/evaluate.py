@@ -5,7 +5,7 @@ One run produces eval_results.json, eval_report.md, and eval_trace.md.
 For every question in the ground-truth file the script:
   1. retrieves the top-k chunks and runs K-Means clustering,
   2. builds overlapping subsets from the K-Means clusters,
-  3. writes one draft per subset with the local Ollama model and lets the
+  3. writes one draft per subset with the OpenRouter drafting model and lets the
      OpenRouter verifier score the drafts (a second call breaks a tie for the top
      score),
   4. runs a plain-RAG baseline once, using all retrieved chunks in one prompt.
@@ -76,6 +76,8 @@ from Speculative_RAG import (  # noqa: E402
     DEFAULT_RETRIEVAL_K,
     DEFAULT_N_CLUSTERS,
     DEFAULT_N_SUBSETS,
+    DRAFT_MODEL,
+    VERIFY_MODEL,
 )
 
 EVAL_PATH = SESSION_DIR / "JSON-Test-cases/ground_truth.json"
@@ -86,6 +88,7 @@ RESULTS_PATH.parent.mkdir(parents=True, exist_ok=True)
 K = DEFAULT_RETRIEVAL_K
 N_SUBSETS = DEFAULT_N_SUBSETS
 N_CLUSTERS = DEFAULT_N_CLUSTERS
+STRATEGIES = ["chain"]  # the only enabled subset strategy
 TRACE = True            # print a human-readable trace of every step (see --quiet)
 TRACE_CHARS = 0         # 0 = show every chunk in full; set --chunk-chars N to clip the terminal
 TRACE_PATH = RESULTS_PATH.with_name("eval_trace.md")
@@ -129,7 +132,7 @@ def matches_item(text, item):
 
 
 def run_drafts_and_verification(question, subsets, token_tracker=None):
-    """Write one draft per subset with Ollama, then verify them with the OpenRouter verifier."""
+    """Write one draft per subset with OpenRouter, then verify them with OpenRouter."""
     with ThreadPoolExecutor(max_workers=len(subsets)) as pool:
         futures = [
             pool.submit(draft, question, subset, i + 1, token_tracker)
@@ -195,19 +198,42 @@ def cluster_sizes(labels):
 # One question
 # --------------------------------------------------------------------------- #
 def build_subsets_timed(docs, labels, distances, embeddings):
-    """Build subsets; return (subsets, seconds, error_text)."""
+    """Build chain subsets; return (subsets, seconds, error_text)."""
     started = time.perf_counter()
     try:
         subsets = build_subsets(
-            docs, labels, n_subsets=N_SUBSETS, distances=distances, embeddings=embeddings
+            docs, labels, n_subsets=N_SUBSETS, distances=distances, embeddings=embeddings,
         )
         return subsets, time.perf_counter() - started, None
     except Exception as error:
-        logger.exception("Subset construction failed")
+        logger.exception("Chain subset construction failed")
         return None, time.perf_counter() - started, str(error)
 
 
-def score_speculative(item, subsets, positions, generated, construction_seconds, generation_seconds):
+def subset_structure(positions, embeddings, distances):
+    """Properties of the subsets themselves (no LLM needed), from 1-based chunk positions."""
+    vectors = np.asarray(embeddings, dtype=float)
+    vectors = vectors / np.maximum(np.linalg.norm(vectors, axis=1, keepdims=True), 1e-12)
+    sims = []
+    for pos in positions:
+        idx = [p - 1 for p in pos]
+        sims += [float(vectors[a] @ vectors[b]) for i, a in enumerate(idx) for b in idx[i + 1:]]
+    used = sorted({p - 1 for pos in positions for p in pos})
+    return {
+        "distinct_chunks_used": len(used),
+        "mean_subset_overlap": mean_pairwise_jaccard(positions),
+        # mean cosine similarity between chunks inside one subset (lower = less repeated content)
+        "intra_subset_similarity": float(np.mean(sims)) if sims else 0.0,
+        # mean retrieval distance of the chunks used (lower = closer to the question)
+        "mean_chunk_distance": (
+            float(np.mean([float(distances[i]) for i in used]))
+            if distances is not None and used else 0.0
+        ),
+    }
+
+
+def score_speculative(item, subsets, positions, generated, construction_seconds,
+                      generation_seconds, structure):
     final_correct = matches_item(generated["answer"], item)
     best = generated["best_draft_index"]
     return {
@@ -225,8 +251,7 @@ def score_speculative(item, subsets, positions, generated, construction_seconds,
         "best_subset_concept_coverage": max(
             concept_coverage(" ".join(subset), item) for subset in subsets
         ),
-        "distinct_chunks_used": len({p for pos in positions for p in pos}),
-        "mean_subset_overlap": mean_pairwise_jaccard(positions),
+        **structure,
         "subset_construction_seconds": construction_seconds,
         "draft_and_verification_seconds": generation_seconds,
     }
@@ -238,6 +263,7 @@ def failed_speculative(error):
         "oracle_draft_correct": False, "subset_hit": False,
         "answer_concept_recall": 0.0, "best_subset_concept_coverage": 0.0,
         "distinct_chunks_used": 0, "mean_subset_overlap": 1.0,
+        "intra_subset_similarity": 0.0, "mean_chunk_distance": 0.0,
         "subset_construction_seconds": 0.0, "draft_and_verification_seconds": 0.0,
     }
 
@@ -323,11 +349,16 @@ def trace_generation(generated, positions):
     emit(build)
 
 
-def score_one_question(item, k, subsets_only):
+def strategy_header(strategy, note=""):
+    emit(lambda full: ["", f"  ######## SUBSET STRATEGY: {strategy}{note} ########"])
+
+
+def score_one_question(item, k, subsets_only, strategies):
     question = item["question"]
     source = item.get("source") or None
     q_tokens = count_question_tokens(question)
-    logger.info("Evaluating %s | question_tokens=%d", item.get("id", "?"), q_tokens)
+    logger.info("Evaluating %s | question_tokens=%d | strategies=%s",
+                item.get("id", "?"), q_tokens, ",".join(strategies))
 
     docs, metas, embeddings, distances = retrieve(
         question, k=k, return_distances=True, source=source
@@ -349,13 +380,20 @@ def score_one_question(item, k, subsets_only):
         (rank for rank, doc in enumerate(docs, start=1) if matches_item(doc, item)), 0
     )
 
-    subsets, construct_sec, error_msg = build_subsets_timed(docs, labels, distances, embeddings)
-    positions = positions_of(docs, subsets) if subsets else None
-
     trace_retrieval(docs, metas, distances, k)
     trace_clusters(docs, labels)
-    if subsets:
-        trace_subsets(docs, labels, positions)
+
+    # Same retrieval and clusters for every strategy; only the subsets differ.
+    built = {}
+    for strategy in strategies:
+        subsets, construct_sec, error_msg = build_subsets_timed(
+            docs, labels, distances, embeddings
+        )
+        positions = positions_of(docs, subsets) if subsets else None
+        built[strategy] = (subsets, positions, construct_sec, error_msg)
+        strategy_header(strategy)
+        if subsets:
+            trace_subsets(docs, labels, positions)
 
     record = {
         **base,
@@ -369,32 +407,68 @@ def score_one_question(item, k, subsets_only):
         },
     }
     if subsets_only:
-        record["subset_positions"] = positions
-        record["subset_error"] = error_msg
+        record["strategies"] = {}
+        for strategy in strategies:
+            subsets, positions, _, error_msg = built[strategy]
+            record["strategies"][strategy] = (
+                {"subset_positions": positions, "subset_error": None,
+                 **subset_structure(positions, embeddings, distances)}
+                if subsets else {"subset_positions": None, "subset_error": error_msg}
+            )
+        first = record["strategies"][strategies[0]]
+        record["subset_positions"] = first.get("subset_positions")
+        record["subset_error"] = first.get("subset_error")
         emit(lambda full: ["  " + "-" * 70])
         return record
 
     token_tracker = {
         "question_tokens": q_tokens,
-        "ollama_input": 0,
-        "ollama_output": 0,
-        "openrouter_input": 0,
-        "openrouter_output": 0,
+        "draft_openrouter_input": 0,
+        "draft_openrouter_output": 0,
+        "draft_openrouter_cost": 0.0,
+        "draft_openrouter_cost_provider_reported_calls": 0,
+        "draft_openrouter_cost_estimated_calls": 0,
+        "verifier_openrouter_input": 0,
+        "verifier_openrouter_output": 0,
+        "verifier_openrouter_cost": 0.0,
+        "verifier_openrouter_cost_provider_reported_calls": 0,
+        "verifier_openrouter_cost_estimated_calls": 0,
     }
 
-    # --- Speculative RAG ------------------------------------------------ #
-    if subsets:
-        started = time.perf_counter()
-        generated = run_drafts_and_verification(question, subsets, token_tracker=token_tracker)
-        seconds_spec = time.perf_counter() - started
-        trace_generation(generated, positions)
-        record["speculative_rag"] = score_speculative(
-            item, subsets, positions, generated, construct_sec, seconds_spec
-        )
-    else:
-        record["speculative_rag"] = failed_speculative(error_msg)
+    # --- Speculative RAG, once per strategy ------------------------------ #
+    record["strategies"] = {}
+    generated_by_strategy = {}
+    seen = {}   # identical subsets -> reuse the drafts instead of paying (and varying) twice
+    for strategy in strategies:
+        subsets, positions, construct_sec, error_msg = built[strategy]
+        if not subsets:
+            record["strategies"][strategy] = failed_speculative(error_msg)
+            continue
+        signature = tuple(tuple(pos) for pos in positions)
+        if signature in seen:
+            twin = seen[signature]
+            result = dict(record["strategies"][twin])
+            result["reused_from"] = twin
+            result["subset_construction_seconds"] = construct_sec
+            generated_by_strategy[strategy] = generated_by_strategy[twin]
+            strategy_header(strategy, f" (identical subsets to {twin}: drafts reused)")
+        else:
+            structure = subset_structure(positions, embeddings, distances)
+            strategy_header(strategy, " (drafting and verification)")
+            started = time.perf_counter()
+            generated = run_drafts_and_verification(question, subsets, token_tracker=token_tracker)
+            seconds_spec = time.perf_counter() - started
+            trace_generation(generated, positions)
+            result = score_speculative(
+                item, subsets, positions, generated, construct_sec, seconds_spec, structure
+            )
+            generated_by_strategy[strategy] = generated
+            seen[signature] = strategy
+        record["strategies"][strategy] = result
+    # first strategy, kept under the old key so older tooling still finds it
+    record["speculative_rag"] = record["strategies"][strategies[0]]
 
-    # --- Plain RAG baseline --------------------------------------------- #
+    # --- Plain RAG baseline (identical for every strategy, so run once) --- #
     started = time.perf_counter()
     baseline_answer = draft(question, docs, draft_idx="baseline", token_tracker=token_tracker)["answer"]
     emit(lambda full: ["", "  == PLAIN RAG (all retrieved chunks in one prompt) ==",
@@ -406,32 +480,61 @@ def score_one_question(item, k, subsets_only):
         "seconds": time.perf_counter() - started,
     }
 
-    final_out_tokens = count_output_tokens(record["speculative_rag"].get("answer", ""))
+    final_out_tokens = {
+        s: count_output_tokens(record["strategies"][s].get("answer", "")) for s in strategies
+    }
     logger.info(
-        "[EVAL TOKEN SUMMARY | %s] question_tokens=%d | final_answer_tokens=%d | "
-        "Ollama(in=%d, out=%d) | OpenRouter(in=%d, out=%d)",
+        "[EVAL TOKEN SUMMARY | %s] question_tokens=%d | final_answer_tokens=%s | "
+        "OpenRouter drafting(in=%d, out=%d) | OpenRouter verification(in=%d, out=%d)",
         item.get("id", "?"),
         q_tokens,
         final_out_tokens,
-        token_tracker["ollama_input"],
-        token_tracker["ollama_output"],
-        token_tracker["openrouter_input"],
-        token_tracker["openrouter_output"],
+        token_tracker["draft_openrouter_input"],
+        token_tracker["draft_openrouter_output"],
+        token_tracker["verifier_openrouter_input"],
+        token_tracker["verifier_openrouter_output"],
+    )
+    record["llm_usage"] = {
+        "draft_model": DRAFT_MODEL,
+        "verifier_model": VERIFY_MODEL,
+        **token_tracker,
+        "total_llm_cost_usd": (token_tracker["draft_openrouter_cost"]
+                               + token_tracker["verifier_openrouter_cost"]),
+    }
+    logger.info(
+        "[EVAL COST SUMMARY | %s] drafting=$%.10f (provider-reported=%d, estimated=%d) | "
+        "verification=$%.10f (provider-reported=%d, estimated=%d) | total=$%.10f USD",
+        item.get("id", "?"),
+        token_tracker["draft_openrouter_cost"],
+        token_tracker["draft_openrouter_cost_provider_reported_calls"],
+        token_tracker["draft_openrouter_cost_estimated_calls"],
+        token_tracker["verifier_openrouter_cost"],
+        token_tracker["verifier_openrouter_cost_provider_reported_calls"],
+        token_tracker["verifier_openrouter_cost_estimated_calls"],
+        record["llm_usage"]["total_llm_cost_usd"],
     )
 
-    spec_v = record["speculative_rag"]
-    emit(lambda full: [
-        "", "  == FINAL ANSWER ==",
-        f"  Speculative RAG: {_clip(spec_v.get('answer', '(no answer)'), True)}",
-        f"      -> selected draft {spec_v.get('best_draft_index', -1) + 1}, "
-        f"{'CORRECT' if spec_v['final_correct'] else 'wrong'} by phrase matching",
-        f"  Plain RAG      : {_clip(baseline_answer, True)}",
-        "", "  == RESULT ==",
-        f"  Expected       : {_clip(item['ground_truth'], full)}",
-        f"  Speculative RAG: {'CORRECT' if spec_v['final_correct'] else 'wrong'}"
-        f"   Plain RAG: {'CORRECT' if record['baseline']['correct'] else 'wrong'}",
-        "  " + "-" * 70,
-    ])
+    def final_lines(full):
+        lines = ["", "  == FINAL ANSWERS =="]
+        for strategy in strategies:
+            r = record["strategies"][strategy]
+            lines += [
+                f"  Speculative RAG [{strategy}]: {_clip(r.get('answer', '(no answer)'), True)}",
+                f"      -> selected draft {r.get('best_draft_index', -1) + 1}, "
+                f"{'CORRECT' if r['final_correct'] else 'wrong'} by phrase matching",
+            ]
+        lines += [
+            f"  Plain RAG      : {_clip(baseline_answer, True)}",
+            "", "  == RESULT ==",
+            f"  Expected       : {_clip(item['ground_truth'], full)}",
+        ]
+        for strategy in strategies:
+            ok = record["strategies"][strategy]["final_correct"]
+            lines.append(f"  {strategy:<9}: {'CORRECT' if ok else 'wrong'}")
+        lines += [f"  Plain RAG: {'CORRECT' if record['baseline']['correct'] else 'wrong'}",
+                  "  " + "-" * 70]
+        return lines
+    emit(final_lines)
     return record
 
 
@@ -447,8 +550,8 @@ def mean(values):
     return float(np.mean(values)) if values else 0.0
 
 
-def summary_row(rows):
-    v = [r["speculative_rag"] for r in rows]
+def summary_row(rows, strategy):
+    v = [r["strategies"][strategy] for r in rows]
     return {
         "accuracy": mean(x["final_correct"] for x in v),
         "oracle": mean(x["oracle_draft_correct"] for x in v),
@@ -457,6 +560,8 @@ def summary_row(rows):
         "best_subset_cov": mean(x["best_subset_concept_coverage"] for x in v),
         "distinct_chunks": mean(x["distinct_chunks_used"] for x in v),
         "overlap": mean(x["mean_subset_overlap"] for x in v),
+        "intra_sim": mean(x["intra_subset_similarity"] for x in v),
+        "chunk_distance": mean(x["mean_chunk_distance"] for x in v),
         "seconds": mean(
             x["subset_construction_seconds"] + x["draft_and_verification_seconds"] for x in v
         ),
@@ -469,12 +574,43 @@ def md_table(headers, rows):
     return "\n".join(lines)
 
 
+def structure_table(rows, strategies):
+    """Properties of the subsets themselves; works without any LLM calls."""
+    table = []
+    for strategy in strategies:
+        v = [r["strategies"][strategy] for r in rows if r["strategies"][strategy].get("subset_positions")
+             or r["strategies"][strategy].get("subset_chunk_positions")]
+        if not v:
+            table.append([strategy, "-", "-", "-", "-"])
+            continue
+        table.append([
+            strategy,
+            f"{mean(x['distinct_chunks_used'] for x in v):.1f}",
+            f"{mean(x['mean_subset_overlap'] for x in v):.2f}",
+            f"{mean(x['intra_subset_similarity'] for x in v):.3f}",
+            f"{mean(x['mean_chunk_distance'] for x in v):.3f}",
+        ])
+    return md_table(
+        ["Strategy", "Distinct chunks used", "Subset overlap (Jaccard)",
+         "Intra-subset similarity (lower = less repeated)", "Mean chunk distance (lower = closer to question)"],
+        table,
+    )
+
+
+def positions_for(record, strategy):
+    r = record["strategies"][strategy]
+    return r.get("subset_positions") or r.get("subset_chunk_positions")
+
+
 def build_report(results, k, subsets_only):
     ok = [r for r in results if r.get("status") == "ok"]
-    out = ["# Evaluation: Speculative RAG vs Plain RAG", ""]
+    strategies = list(ok[0]["strategies"]) if ok else list(STRATEGIES)
+    multi = len(strategies) > 1
+    title = "Subset strategies vs Plain RAG" if multi else "Speculative RAG vs Plain RAG"
+    out = [f"# Evaluation: {title}", ""]
     out.append(
         f"Questions completed: **{len(ok)}** of {len(results)} | retrieval k = {k} | "
-        f"clusters = {N_CLUSTERS} | subsets = {N_SUBSETS}"
+        f"clusters = {N_CLUSTERS} | subsets = {N_SUBSETS} | strategies = {', '.join(strategies)}"
     )
     if not ok:
         out.append("\nNo completed questions, so no metrics can be calculated.")
@@ -482,66 +618,138 @@ def build_report(results, k, subsets_only):
 
     if subsets_only:
         out += ["", "_Subsets-only run: no drafts or verification were executed, so no "
-                "accuracy metrics were produced._"]
+                "accuracy metrics were produced. The table below describes the subsets only._",
+                "", "## Subset structure", "", structure_table(ok, strategies)]
         return "\n".join(out)
 
-    spec = summary_row(ok)
     base_acc = mean(r["baseline"]["correct"] for r in ok)
     base_recall = mean(r["baseline"]["answer_concept_recall"] for r in ok)
     base_sec = mean(r["baseline"]["seconds"] for r in ok)
     mrr = mean(r["retrieval"]["reciprocal_rank"] for r in ok)
+    spec = {s: summary_row(ok, s) for s in strategies}
 
+    rows = [
+        [f"Speculative RAG [{s}]", pct(m["accuracy"]), pct(m["oracle"]), pct(m["subset_hit"]),
+         pct(m["concept_recall"]), pct(m["best_subset_cov"]),
+         f"{m['distinct_chunks']:.1f}", f"{m['overlap']:.2f}", f"{m['seconds']:.1f}"]
+        for s, m in spec.items()
+    ]
+    rows.append(["Plain RAG (baseline)", pct(base_acc), "-", "-", pct(base_recall), "-", "-", "-",
+                 f"{base_sec:.1f}"])
     out += ["", "## 1. Overall results (all questions)", "", md_table(
         ["System", "Final acc.", "Oracle", "Subset hit", "Concept recall",
-         "Best-subset cov.", "Distinct chunks", "Subset overlap", "Avg sec"],
-        [
-            ["Speculative RAG", pct(spec["accuracy"]), pct(spec["oracle"]), pct(spec["subset_hit"]),
-             pct(spec["concept_recall"]), pct(spec["best_subset_cov"]),
-             f"{spec['distinct_chunks']:.1f}", f"{spec['overlap']:.2f}", f"{spec['seconds']:.1f}"],
-            ["Plain RAG (baseline)", pct(base_acc), "-", "-", pct(base_recall), "-", "-", "-",
-             f"{base_sec:.1f}"],
-        ],
+         "Best-subset cov.", "Distinct chunks", "Subset overlap", "Avg sec"], rows,
     ), "", f"Retrieval MRR: **{mrr:.3f}**"]
 
-    out += ["", "## 2. Accuracy by difficulty", ""]
+    usage_rows = [r.get("llm_usage", {}) for r in ok if r.get("llm_usage")]
+    if usage_rows:
+        draft_cost = sum(float(u.get("draft_openrouter_cost", 0.0)) for u in usage_rows)
+        verify_cost = sum(float(u.get("verifier_openrouter_cost", 0.0)) for u in usage_rows)
+        total_cost = sum(float(u.get("total_llm_cost_usd", 0.0)) for u in usage_rows)
+        draft_in = sum(int(u.get("draft_openrouter_input", 0)) for u in usage_rows)
+        draft_out = sum(int(u.get("draft_openrouter_output", 0)) for u in usage_rows)
+        verify_in = sum(int(u.get("verifier_openrouter_input", 0)) for u in usage_rows)
+        verify_out = sum(int(u.get("verifier_openrouter_output", 0)) for u in usage_rows)
+        out += ["", "## 2. LLM usage and estimated/charged cost", "",
+                f"- Drafting model (**{DRAFT_MODEL}**): {draft_in:,} input tokens, "
+                f"{draft_out:,} output tokens, **${draft_cost:.10f}**.",
+                f"- Verification model (**{VERIFY_MODEL}**): {verify_in:,} input tokens, "
+                f"{verify_out:,} output tokens, **${verify_cost:.10f}**.",
+                f"- **Total LLM cost: ${total_cost:.10f} USD** across {len(usage_rows)} questions.",
+                "- Per-request costs use OpenRouter's reported `usage.cost` when available; "
+                "otherwise they are estimated from configured per-million-token rates."]
+        out += [""]
+        difficulty_section = 3
+    else:
+        difficulty_section = 2
+
+    out += ["", f"## {difficulty_section}. Accuracy by difficulty", ""]
     level_rows = []
     for level in ("easy", "medium", "hard"):
-        rows = [r for r in ok if r.get("level") == level]
-        if rows:
-            ls = summary_row(rows)
-            level_rows.append([
-                f"{level.title()} ({len(rows)})",
-                pct(ls["accuracy"]),
-                pct(mean(r["baseline"]["correct"] for r in rows)),
-            ])
-    out.append(md_table(["Level", "Speculative RAG", "Plain RAG"], level_rows))
+        group = [r for r in ok if r.get("level") == level]
+        if group:
+            level_rows.append(
+                [f"{level.title()} ({len(group)})"]
+                + [pct(summary_row(group, s)["accuracy"]) for s in strategies]
+                + [pct(mean(r["baseline"]["correct"] for r in group))]
+            )
+    out.append(md_table(["Level"] + [f"Speculative [{s}]" for s in strategies] + ["Plain RAG"],
+                        level_rows))
 
-    wins = sum(r["speculative_rag"]["final_correct"] and not r["baseline"]["correct"] for r in ok)
-    losses = sum(r["baseline"]["correct"] and not r["speculative_rag"]["final_correct"] for r in ok)
-    ties = len(ok) - wins - losses
-    out += ["", "## 3. Head-to-head vs Plain RAG (final answer correct)", "", md_table(
-        ["Speculative better", "Plain RAG better", "Same outcome", "Exact sign test p"],
-        [[wins, losses, ties, f"{sign_test_p(wins, losses):.3f}"]],
+    h2h = []
+    for s in strategies:
+        wins = sum(r["strategies"][s]["final_correct"] and not r["baseline"]["correct"] for r in ok)
+        losses = sum(r["baseline"]["correct"] and not r["strategies"][s]["final_correct"] for r in ok)
+        h2h.append([s, wins, losses, len(ok) - wins - losses, f"{sign_test_p(wins, losses):.3f}"])
+    out += ["", f"## {difficulty_section + 1}. Head-to-head vs Plain RAG (final answer correct)", "", md_table(
+        ["Strategy", "Speculative better", "Plain RAG better", "Same outcome", "Exact sign test p"], h2h,
     )]
 
-    out += ["", "## 4. Per-question results", "", md_table(
-        ["ID", "Level", "Cluster sizes", "Speculative RAG", "Plain RAG"],
-        [[r["id"], r["level"],
-          "/".join(map(str, r["retrieval"]["cluster_sizes"].values())),
-          "✓" if r["speculative_rag"]["final_correct"] else "✗",
-          "✓" if r["baseline"]["correct"] else "✗"] for r in ok],
-    )]
+    section = difficulty_section + 2
+    if multi:
+        pair_rows = []
+        for i, a in enumerate(strategies):
+            for b in strategies[i + 1:]:
+                wins = sum(r["strategies"][a]["final_correct"] and not r["strategies"][b]["final_correct"]
+                           for r in ok)
+                losses = sum(r["strategies"][b]["final_correct"] and not r["strategies"][a]["final_correct"]
+                             for r in ok)
+                identical = sum(
+                    positions_for(r, a) is not None and positions_for(r, a) == positions_for(r, b)
+                    for r in ok
+                )
+                pair_rows.append([
+                    f"{a} vs {b}", wins, losses, len(ok) - wins - losses,
+                    f"{sign_test_p(wins, losses):.3f}",
+                    f"{pct(spec[a]['concept_recall'])} / {pct(spec[b]['concept_recall'])}",
+                    f"{identical} of {len(ok)}",
+                ])
+        out += ["", f"## {section}. Strategy vs strategy (final answer correct)", "", md_table(
+            ["Comparison", "First better", "Second better", "Same outcome", "Exact sign test p",
+             "Concept recall (first / second)", "Questions with identical subsets"], pair_rows,
+        ), "", "_Questions where two strategies built identical subsets reuse the same drafts, so "
+                "they can never count as a win for either side._"]
+        section += 1
 
-    out += ["", "## 5. Reading the results", ""]
-    if spec["accuracy"] > base_acc:
-        out.append(f"Speculative RAG scored higher on final accuracy ({pct(spec['accuracy'])} vs "
+    def mark(r, s):
+        return "✓" if r["strategies"][s]["final_correct"] else "✗"
+
+    out += ["", f"## {section}. Per-question results", "", md_table(
+        ["ID", "Level", "Cluster sizes"] + strategies + ["Plain RAG"],
+        [[r["id"], r["level"], "/".join(map(str, r["retrieval"]["cluster_sizes"].values()))]
+         + [mark(r, s) for s in strategies]
+         + ["✓" if r["baseline"]["correct"] else "✗"] for r in ok],
+    )]
+    section += 1
+
+    out += ["", f"## {section}. Subset structure", "", structure_table(ok, strategies)]
+    section += 1
+
+    out += ["", f"## {section}. Reading the results", ""]
+    best = max(strategies, key=lambda s: (spec[s]["accuracy"], spec[s]["concept_recall"]))
+    for s in strategies:
+        out.append(f"- **{s}**: final accuracy {pct(spec[s]['accuracy'])}, "
+                   f"concept recall {pct(spec[s]['concept_recall'])}.")
+    if multi:
+        tied = [s for s in strategies if spec[s]["accuracy"] == spec[best]["accuracy"]]
+        if len(tied) > 1:
+            out.append(f"- Final accuracy is tied between {', '.join(tied)}; "
+                       "compare concept recall and the structure table.")
+        else:
+            out.append(f"- Highest final accuracy: **{best}**.")
+        out.append(f"- With {len(ok)} questions, a gap of one or two questions is within noise "
+                   "(the drafts come from an LLM and are not perfectly repeatable). "
+                   "Trust the sign-test p-values in the strategy-vs-strategy table, "
+                   "not the raw percentages.")
+    elif spec[best]["accuracy"] > base_acc:
+        out.append(f"Speculative RAG scored higher on final accuracy ({pct(spec[best]['accuracy'])} vs "
                    f"{pct(base_acc)}).")
-    elif spec["accuracy"] < base_acc:
+    elif spec[best]["accuracy"] < base_acc:
         out.append(f"Plain RAG scored higher on final accuracy ({pct(base_acc)} vs "
-                   f"{pct(spec['accuracy'])}).")
+                   f"{pct(spec[best]['accuracy'])}).")
     else:
-        out.append(f"Final accuracy is tied ({pct(spec['accuracy'])}); compare concept recall "
-                   f"({pct(spec['concept_recall'])} vs {pct(base_recall)}) above.")
+        out.append(f"Final accuracy is tied ({pct(spec[best]['accuracy'])}); compare concept recall "
+                   f"({pct(spec[best]['concept_recall'])} vs {pct(base_recall)}) above.")
     return "\n".join(out)
 
 
@@ -549,7 +757,7 @@ def build_report(results, k, subsets_only):
 # Main
 # --------------------------------------------------------------------------- #
 def evaluate():
-    global N_CLUSTERS, TRACE, TRACE_CHARS
+    global N_CLUSTERS, TRACE, TRACE_CHARS, STRATEGIES
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawTextHelpFormatter)
     parser.add_argument("--k", type=int, default=K, help=f"chunks to retrieve (default {K})")
     parser.add_argument("--clusters", type=int, default=N_CLUSTERS,
@@ -573,6 +781,7 @@ def evaluate():
             "build_subsets() first."
         )
     N_CLUSTERS = args.clusters
+    STRATEGIES = ["chain"]
     TRACE, TRACE_CHARS = not args.quiet, args.chunk_chars
     if TRACE:
         TRACE_PATH.write_text("# Evaluation trace (full chunk text)\n", encoding="utf-8")
@@ -589,7 +798,8 @@ def evaluate():
         raise SystemExit("No questions selected.")
 
     print(f"Loaded {len(items)} questions from {EVAL_PATH}")
-    print(f"Retrieval k={args.k}; clusters={N_CLUSTERS}; subsets={N_SUBSETS}")
+    print(f"Retrieval k={args.k}; clusters={N_CLUSTERS}; subsets={N_SUBSETS}; "
+          f"strategies={', '.join(STRATEGIES)}")
     if not args.subsets_only and MIN_INTERVAL > 0:
         print(f"Verifier pacing: {MIN_INTERVAL:g}s minimum interval between calls.")
 
@@ -607,7 +817,7 @@ def evaluate():
         print(f"\n[{index}/{len(items)}] [{item.get('level', '?')}] {item.get('id', '')} "
               f"{item['question']}", flush=True)
         try:
-            results.append(score_one_question(item, args.k, args.subsets_only))
+            results.append(score_one_question(item, args.k, args.subsets_only, STRATEGIES))
         except Exception as error:
             logger.exception("Question %s failed", item.get("id"))
             results.append({"id": item.get("id"), "question": item["question"],

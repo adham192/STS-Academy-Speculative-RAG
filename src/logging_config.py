@@ -18,7 +18,7 @@ LOG_FORMAT = "%(asctime)s | %(levelname)-8s | %(name)s | %(message)s"
 DATE_FORMAT = "%Y-%m-%d %H:%M:%S"
 
 # Third-party libraries emit their own DEBUG lines (every HTTP call etc.); keep them quiet.
-NOISY_LOGGERS = ("httpx", "httpcore", "urllib3", "chromadb", "google_genai", "asyncio")
+NOISY_LOGGERS = ("httpx", "httpcore", "urllib3", "chromadb", "asyncio")
 
 
 def _script_folder() -> Path:
