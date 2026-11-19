@@ -15,6 +15,7 @@ from sqlalchemy.exc import IntegrityError, SQLAlchemyError
 from sqlalchemy.orm import DeclarativeBase, Mapped, Session, mapped_column
 
 import settings
+from text_utils import clip_for_log
 
 logger = logging.getLogger("backend.database")
 
@@ -98,7 +99,14 @@ def find_answer(q_hash: str):
             row = session.execute(
                 select(QARecord.answer, QARecord.documents).where(QARecord.question_hash == q_hash)
             ).first()
-        return {"answer": row.answer, "documents": list(row.documents or [])} if row else None
+        if not row:
+            logger.info("[DB] PostgreSQL MISS key=%s", q_hash[:12])
+            return None
+        logger.info(
+            "[DB] PostgreSQL HIT key=%s | documents=%s | answer=%r",
+            q_hash[:12], list(row.documents or []), clip_for_log(row.answer),
+        )
+        return {"answer": row.answer, "documents": list(row.documents or [])}
     except SQLAlchemyError as error:
         logger.error("PostgreSQL lookup failed: %s", error)
         return None
@@ -114,6 +122,10 @@ def save_answer(question, normalized, scope, q_hash, answer, documents) -> bool:
             ))
             try:
                 session.commit()
+                logger.info(
+                    "[DB] PostgreSQL STORE key=%s | question=%r | documents=%s | answer_chars=%d",
+                    q_hash[:12], clip_for_log(question), list(documents), len(answer),
+                )
             except IntegrityError:
                 session.rollback()
                 logger.debug("Duplicate question ignored (%s)", q_hash[:12])

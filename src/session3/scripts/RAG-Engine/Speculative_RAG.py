@@ -14,7 +14,6 @@ import numpy as np
 import requests
 import chromadb
 import pymupdf
-import ollama
 from dotenv import load_dotenv
 from sklearn.cluster import KMeans
 
@@ -50,17 +49,15 @@ load_dotenv()
 
 OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY")
 EMBED_MODEL = os.getenv("OPENROUTER_MODEL")
-OLLAMA_HOST = os.getenv("OLLAMA_HOST")
-DRAFT_MODEL = os.getenv("LOCAL_MODEL")
-VERIFY_API_KEY = os.getenv("api-key")      # OpenRouter key used for verification
+DRAFT_MODEL = os.getenv("DRAFT_MODEL", "qwen/qwen3.5-9b").strip()
+OPENROUTER_CHAT_API_KEY = os.getenv("api-key")  # shared by drafting and verification
 VERIFY_MODEL = os.getenv("model")          # OpenRouter model id, e.g. qwen/qwen3.7-flash
 
 REQUIRED = {
     "OPENROUTER_API_KEY": OPENROUTER_API_KEY,
     "OPENROUTER_MODEL": EMBED_MODEL,
-    "OLLAMA_HOST": OLLAMA_HOST,
-    "LOCAL_MODEL": DRAFT_MODEL,
-    "api-key": VERIFY_API_KEY,
+    "DRAFT_MODEL": DRAFT_MODEL,
+    "api-key": OPENROUTER_CHAT_API_KEY,
     "model": VERIFY_MODEL,
 }
 missing = [name for name, value in REQUIRED.items() if not value]
@@ -68,7 +65,6 @@ if missing:
     logger.critical("Missing values in .env: %s", ", ".join(missing))
     raise RuntimeError(f"Missing values in .env: {', '.join(missing)}")
 
-ollama_client = ollama.Client(host=OLLAMA_HOST, timeout=None)
 OPENROUTER_CHAT_URL = "https://openrouter.ai/api/v1/chat/completions"
 VERIFY_TIMEOUT = 90  # seconds per verification request
 
@@ -82,6 +78,9 @@ DEFAULT_N_SUBSETS = 5
 CHUNKS_PER_CLUSTER_PER_SUBSET = 2
 CHUNKS_PER_SUBSET = 4
 
+# The pipeline uses the embedding-guided overlapping chain strategy exclusively.
+CHAIN_SIMILARITY_WEIGHT = 0.70
+
 BASE_DIR = Path(__file__).resolve().parent
 CHROMA_PATH = str(SESSION_DIR / "chroma_db")
 DOCS_DIR = SESSION_DIR / "pdfs"
@@ -90,7 +89,7 @@ DOCS_DIR.mkdir(exist_ok=True)
 if not any(DOCS_DIR.glob("*.pdf")):
     logger.warning("No PDFs found in %s yet. Upload one from the UI or drop it in the folder", DOCS_DIR)
 
-logger.info("Verifier model: %r | Draft model: %r", VERIFY_MODEL, DRAFT_MODEL)
+logger.info("OpenRouter verifier model: %r | drafting model: %r", VERIFY_MODEL, DRAFT_MODEL)
 
 
 # --------------------------------------------------------------------------- #
@@ -126,8 +125,7 @@ def count_output_tokens(output_text, provider_tokens=None):
 
 
 # --------------------------------------------------------------------------- #
-# Cost calculation (OpenRouter verifier only; Ollama runs locally, so it is free)
-# Prices are USD per 1,000,000 tokens. Defaults are for qwen3.7-flash; override in .env.
+# OpenRouter cost calculation for both drafting and verification. Prices are USD per 1,000,000 tokens.
 # --------------------------------------------------------------------------- #
 def _price_from_env(name, default):
     try:
@@ -136,8 +134,14 @@ def _price_from_env(name, default):
         return float(default)
 
 
+# Verifier prices retain the existing environment overrides.
 OPENROUTER_INPUT_PRICE_PER_M = _price_from_env("OPENROUTER_INPUT_PRICE_PER_M", "0.03")
 OPENROUTER_OUTPUT_PRICE_PER_M = _price_from_env("OPENROUTER_OUTPUT_PRICE_PER_M", "0.13")
+# Published standard OpenRouter rates for qwen/qwen3.5-9b; provider routing can vary.
+DRAFT_INPUT_PRICE_PER_M = _price_from_env("DRAFT_OPENROUTER_INPUT_PRICE_PER_M", "0.08")
+DRAFT_OUTPUT_PRICE_PER_M = _price_from_env("DRAFT_OPENROUTER_OUTPUT_PRICE_PER_M", "0.13")
+# openai/text-embedding-3-small standard (non-batch) input price, USD per 1M tokens.
+EMBEDDING_INPUT_PRICE_PER_M = _price_from_env("EMBEDDING_INPUT_PRICE_PER_M", "0.02")
 
 
 def calculate_cost(input_tokens, output_tokens,
@@ -151,6 +155,17 @@ def calculate_cost(input_tokens, output_tokens,
     input_cost = (input_tokens / 1_000_000) * input_price_per_m
     output_cost = (output_tokens / 1_000_000) * output_price_per_m
     return input_cost, output_cost, input_cost + output_cost
+
+
+def _record_provider_cost(usage, input_tokens, output_tokens, input_price_per_m, output_price_per_m):
+    """Prefer OpenRouter's reported charge; fall back to the configured token rates."""
+    reported = (usage or {}).get("cost")
+    if isinstance(reported, (int, float)) and reported >= 0:
+        return float(reported), "provider-reported"
+    _, _, estimated = calculate_cost(
+        input_tokens, output_tokens, input_price_per_m, output_price_per_m
+    )
+    return estimated, "rate-estimate"
 
 
 # --------------------------------------------------------------------------- #
@@ -199,12 +214,23 @@ def split_text_to_chunks(text):
     return chunks
 
 
-def get_embeddings(texts):
-    """Embed texts in batches through the OpenRouter embeddings API."""
+def get_embeddings(texts, purpose="embedding", token_tracker=None):
+    """Embed texts through OpenRouter and log token usage plus USD cost.
+
+    Embeddings are input-only: cost is based on the number of input tokens sent
+    to the embedding endpoint. Provider usage/cost is preferred when returned;
+    otherwise token count is estimated locally and priced using the configured
+    per-million-token rate.
+    """
     vectors = []
-    logger.debug("Embedding %d texts through OpenRouter", len(texts))
-    for i in range(0, len(texts), EMBED_BATCH_SIZE):
-        batch = texts[i:i + EMBED_BATCH_SIZE]
+    total_tokens = 0
+    total_cost = 0.0
+    provider_cost_calls = 0
+    estimated_cost_calls = 0
+
+    logger.debug("Embedding %d texts through OpenRouter (%s)", len(texts), purpose)
+    for batch_number, start in enumerate(range(0, len(texts), EMBED_BATCH_SIZE), start=1):
+        batch = texts[start:start + EMBED_BATCH_SIZE]
         response = requests.post(
             "https://openrouter.ai/api/v1/embeddings",
             headers={"Authorization": f"Bearer {OPENROUTER_API_KEY}"},
@@ -212,8 +238,62 @@ def get_embeddings(texts):
             timeout=60,
         )
         response.raise_for_status()
-        data = sorted(response.json()["data"], key=lambda item: item["index"])
+        body = response.json()
+        data = sorted(body["data"], key=lambda item: item["index"])
         vectors.extend(item["embedding"] for item in data)
+
+        usage = body.get("usage") or {}
+        reported_tokens = usage.get("prompt_tokens")
+        if not isinstance(reported_tokens, int) or reported_tokens < 0:
+            reported_tokens = usage.get("total_tokens")
+        if isinstance(reported_tokens, int) and reported_tokens >= 0:
+            input_tokens = reported_tokens
+            token_source = "provider-reported"
+        else:
+            input_tokens = sum(_estimate_tokens(item) for item in batch)
+            token_source = "local-estimate"
+
+        reported_cost = usage.get("cost")
+        if isinstance(reported_cost, (int, float)) and reported_cost >= 0:
+            batch_cost = float(reported_cost)
+            cost_source = "provider-reported"
+            provider_cost_calls += 1
+        else:
+            batch_cost = (input_tokens / 1_000_000) * EMBEDDING_INPUT_PRICE_PER_M
+            cost_source = "rate-estimate"
+            estimated_cost_calls += 1
+
+        total_tokens += input_tokens
+        total_cost += batch_cost
+
+        if token_tracker is not None:
+            token_tracker["embedding_input_tokens"] = token_tracker.get("embedding_input_tokens", 0) + input_tokens
+            token_tracker["embedding_cost"] = token_tracker.get("embedding_cost", 0.0) + batch_cost
+            token_tracker["embedding_calls"] = token_tracker.get("embedding_calls", 0) + 1
+            token_tracker["embedding_provider_reported_cost_calls"] = (
+                token_tracker.get("embedding_provider_reported_cost_calls", 0)
+                + int(cost_source == "provider-reported")
+            )
+            token_tracker["embedding_estimated_cost_calls"] = (
+                token_tracker.get("embedding_estimated_cost_calls", 0)
+                + int(cost_source == "rate-estimate")
+            )
+
+        logger.info(
+            "[EMBEDDING COST] model=%s | purpose=%s | batch=%d | texts=%d | "
+            "input_tokens=%d (%s) | cost=$%.10f (%s) | rate=$%.4f/1M tokens",
+            EMBED_MODEL, purpose, batch_number, len(batch), input_tokens,
+            token_source, batch_cost, cost_source, EMBEDDING_INPUT_PRICE_PER_M,
+        )
+
+    if texts:
+        logger.info(
+            "[EMBEDDING SUMMARY] model=%s | purpose=%s | texts=%d | "
+            "input_tokens=%d | total_cost=$%.10f USD | provider_cost_batches=%d | "
+            "estimated_cost_batches=%d",
+            EMBED_MODEL, purpose, len(texts), total_tokens, total_cost,
+            provider_cost_calls, estimated_cost_calls,
+        )
     return vectors
 
 
@@ -252,11 +332,17 @@ def ingest_pdf(pdf_path, name=None, progress_callback=None):
 
     total = len(chunks)
     logger.info("[STAGE: INDEXING] Embedding and indexing %s (%d chunks)...", name, total)
+    document_embedding_cost = 0.0
+    document_embedding_tokens = 0
     for start in range(0, total, EMBED_BATCH_SIZE):
         batch = chunks[start:start + EMBED_BATCH_SIZE]
+        batch_usage = {}
+        batch_vectors = get_embeddings(batch, purpose=f"indexing:{name}", token_tracker=batch_usage)
+        document_embedding_cost += batch_usage.get("embedding_cost", 0.0)
+        document_embedding_tokens += batch_usage.get("embedding_input_tokens", 0)
         collection.add(
             documents=batch,
-            embeddings=get_embeddings(batch),
+            embeddings=batch_vectors,
             metadatas=[{
                 "source": name,
                 "file_hash": file_hash,
@@ -267,6 +353,11 @@ def ingest_pdf(pdf_path, name=None, progress_callback=None):
         logger.debug("Stored %d/%d chunks of %s", min(start + len(batch), total), total, name)
         if progress_callback:
             progress_callback(min(start + len(batch), total), total)
+    logger.info(
+        "[DOCUMENT EMBEDDING COST] file=%s | model=%s | chunks=%d | input_tokens=%d | "
+        "total_cost=$%.10f USD",
+        name, EMBED_MODEL, total, document_embedding_tokens, document_embedding_cost,
+    )
     logger.info("Indexed %s: %d chunks", name, total)
     return "added", total
 
@@ -314,7 +405,7 @@ def delete_document(name):
 # --------------------------------------------------------------------------- #
 # Retrieval, clustering, reranking, and subset construction
 # --------------------------------------------------------------------------- #
-def retrieve(question, k=DEFAULT_RETRIEVAL_K, return_distances=False, source=None):
+def retrieve(question, k=DEFAULT_RETRIEVAL_K, return_distances=False, source=None, token_tracker=None):
     """
     Return the top-k retrieved chunks, metadata, and embeddings.
 
@@ -345,7 +436,7 @@ def retrieve(question, k=DEFAULT_RETRIEVAL_K, return_distances=False, source=Non
         "Retrieving the top %d of %d chunks (scope: %s)",
         min(k, count), count, source or "all documents",
     )
-    q_emb = get_embeddings([question])[0]
+    q_emb = get_embeddings([question], purpose="question-retrieval", token_tracker=token_tracker)[0]
     query_args = dict(
         query_embeddings=[q_emb],
         n_results=min(k, count),
@@ -462,10 +553,7 @@ def build_subsets(
     distances=None,
     embeddings=None,
 ):
-    """
-    Build the evidence subsets for the drafts: four chunks per subset, two from
-    each of the two K-Means clusters.
-    """
+    """Build four-chunk evidence subsets using the embedding-guided chain strategy."""
     if len(docs) != len(labels):
         raise ValueError("The number of documents must match the number of cluster labels.")
     if not docs:
@@ -510,10 +598,12 @@ def build_subsets(
         second_members = []
 
     first_schedule = _make_embedding_pair_schedule(
-        first_members, embeddings, distances, n_subsets
+        first_members, embeddings, distances, n_subsets,
+        similarity_weight=CHAIN_SIMILARITY_WEIGHT,
     )
     second_schedule = _make_embedding_pair_schedule(
-        second_members, embeddings, distances, n_subsets
+        second_members, embeddings, distances, n_subsets,
+        similarity_weight=CHAIN_SIMILARITY_WEIGHT,
     )
 
     if distances is not None:
@@ -521,6 +611,7 @@ def build_subsets(
     else:
         global_rank = list(range(len(docs)))
 
+    # Rotate the second cluster's chain to avoid repeatedly pairing the same cluster members.
     rotation = min(2, n_subsets - 1) if n_subsets > 1 else 0
 
     subsets = []
@@ -567,7 +658,7 @@ def build_subsets(
 
 
 # --------------------------------------------------------------------------- #
-# Drafting (local Ollama model)
+# Drafting (OpenRouter)
 # --------------------------------------------------------------------------- #
 DRAFT_PROMPT = """
 Answer the question using ONLY the documents below.
@@ -592,40 +683,99 @@ If the documents do not contain the answer, say so in the answer.
 """
 
 
+def _call_openrouter_text(prompt, model, stage_label, token_tracker=None, json_mode=False):
+    """Call an OpenRouter chat model and return its text response."""
+    payload = {
+        "model": model,
+        "messages": [{"role": "user", "content": prompt}],
+        "temperature": 0,
+    }
+    if json_mode:
+        payload["response_format"] = {"type": "json_object"}
+    payload["usage"] = {"include": True}
+
+    response = None
+    started = time.perf_counter()
+    for attempt in range(3):
+        try:
+            response = requests.post(
+                OPENROUTER_CHAT_URL,
+                headers={
+                    "Authorization": f"Bearer {OPENROUTER_CHAT_API_KEY}",
+                    "Content-Type": "application/json",
+                },
+                json=payload,
+                timeout=VERIFY_TIMEOUT,
+            )
+        except requests.RequestException as error:
+            if attempt == 2:
+                raise VerifierHTTPError(None, f"network error: {error}") from error
+            time.sleep(2 ** attempt)
+            continue
+
+        if response.status_code == 200:
+            break
+        retry_after = response.headers.get("Retry-After")
+        api_error = VerifierHTTPError(
+            response.status_code, response.text[:300],
+            float(retry_after) if retry_after and retry_after.replace(".", "", 1).isdigit() else None,
+        )
+        if response.status_code in (401, 402, 403, 404) or attempt == 2:
+            raise api_error
+        time.sleep(api_error.retry_after + 1 if api_error.retry_after else 2 ** attempt)
+
+    elapsed = time.perf_counter() - started
+    body = response.json()
+    if body.get("error"):
+        err = body["error"]
+        code = err.get("code") if isinstance(err, dict) else None
+        message = err.get("message") if isinstance(err, dict) else str(err)
+        raise VerifierHTTPError(code if isinstance(code, int) else None, str(message)[:300])
+    try:
+        content = body["choices"][0]["message"].get("content")
+    except (KeyError, IndexError, TypeError, AttributeError) as error:
+        raise ValueError(f"Unexpected OpenRouter response: {str(body)[:200]}") from error
+    if not isinstance(content, str) or not content.strip():
+        raise ValueError(f"OpenRouter returned an empty response for {stage_label}")
+
+    usage = body.get("usage") or {}
+    in_tok = count_input_tokens(prompt, usage.get("prompt_tokens"))
+    out_tok = count_output_tokens(content, usage.get("completion_tokens"))
+    logger.info(
+        "[TOKENS | OpenRouter %s] %s finished in %.2fs | input_tokens=%d | output_tokens=%d",
+        model, stage_label, elapsed, in_tok, out_tok,
+    )
+    if token_tracker is not None:
+        token_tracker["draft_openrouter_input"] += in_tok
+        token_tracker["draft_openrouter_output"] += out_tok
+        call_cost, cost_source = _record_provider_cost(
+            usage, in_tok, out_tok, DRAFT_INPUT_PRICE_PER_M, DRAFT_OUTPUT_PRICE_PER_M
+        )
+        token_tracker["draft_openrouter_cost"] += call_cost
+        token_tracker["draft_openrouter_cost_provider_reported_calls"] += int(
+            cost_source == "provider-reported"
+        )
+        token_tracker["draft_openrouter_cost_estimated_calls"] += int(
+            cost_source == "rate-estimate"
+        )
+        logger.info("[COST | OpenRouter %s] %s cost=$%.10f (%s)",
+                    model, stage_label, call_cost, cost_source)
+    return content
+
+
 def draft(question, subset, draft_idx=None, token_tracker=None):
-    """Generate one draft answer + rationale from a subset of documents."""
+    """Generate one draft answer + rationale using the configured OpenRouter drafting model."""
     docs_text = "\n\n".join(f"[{i}] {d}" for i, d in enumerate(subset, start=1))
     prompt = DRAFT_PROMPT.format(docs=docs_text, question=question)
     label = f"Draft {draft_idx}" if draft_idx is not None else "Draft"
-    logger.debug("Calling Ollama model %s for %s with %d chunks", DRAFT_MODEL, label, len(subset))
-
-    started = time.perf_counter()
-    res = ollama_client.chat(
-        model=DRAFT_MODEL,
-        messages=[{"role": "user", "content": prompt}],
-        format="json",
-        options={"temperature": 0, "num_predict": 768},
+    logger.debug("Calling OpenRouter drafting model %s for %s with %d chunks", DRAFT_MODEL, label, len(subset))
+    raw = _call_openrouter_text(
+        prompt, DRAFT_MODEL, label, token_tracker=token_tracker, json_mode=True,
     )
-    elapsed = time.perf_counter() - started
-    raw = res["message"]["content"]
-
-    in_tok = count_input_tokens(prompt, res.get("prompt_eval_count"))
-    out_tok = count_output_tokens(raw, res.get("eval_count"))
-    logger.info(
-        "[TOKENS | Ollama %s] %s finished in %.2fs | input_tokens=%d | output_tokens=%d",
-        DRAFT_MODEL, label, elapsed, in_tok, out_tok,
-    )
-    if token_tracker is not None:
-        token_tracker["ollama_input"] += in_tok
-        token_tracker["ollama_output"] += out_tok
-
     try:
-        data = json.loads(raw)
-        return {
-            "answer": str(data.get("answer", "")),
-            "rationale": str(data.get("rationale", "")),
-        }
-    except (json.JSONDecodeError, AttributeError):
+        data = _extract_json(raw)
+        return {"answer": str(data.get("answer", "")), "rationale": str(data.get("rationale", ""))}
+    except (ValueError, AttributeError):
         logger.warning("%s was not valid JSON, using the raw text instead", label)
         return {"answer": raw, "rationale": ""}
 
@@ -766,7 +916,7 @@ def call_verifier(prompt, stage_label="verify", token_tracker=None):
         response = requests.post(
             OPENROUTER_CHAT_URL,
             headers={
-                "Authorization": f"Bearer {VERIFY_API_KEY}",
+                "Authorization": f"Bearer {OPENROUTER_CHAT_API_KEY}",
                 "Content-Type": "application/json",
             },
             json={
@@ -774,6 +924,7 @@ def call_verifier(prompt, stage_label="verify", token_tracker=None):
                 "messages": [{"role": "user", "content": prompt}],
                 "temperature": 0,
                 "response_format": {"type": "json_object"},
+                "usage": {"include": True},
             },
             timeout=VERIFY_TIMEOUT,
         )
@@ -807,8 +958,20 @@ def call_verifier(prompt, stage_label="verify", token_tracker=None):
         VERIFY_MODEL, stage_label, elapsed, in_tok, out_tok,
     )
     if token_tracker is not None:
-        token_tracker["openrouter_input"] += in_tok
-        token_tracker["openrouter_output"] += out_tok
+        token_tracker["verifier_openrouter_input"] += in_tok
+        token_tracker["verifier_openrouter_output"] += out_tok
+        call_cost, cost_source = _record_provider_cost(
+            usage, in_tok, out_tok, OPENROUTER_INPUT_PRICE_PER_M, OPENROUTER_OUTPUT_PRICE_PER_M
+        )
+        token_tracker["verifier_openrouter_cost"] += call_cost
+        token_tracker["verifier_openrouter_cost_provider_reported_calls"] += int(
+            cost_source == "provider-reported"
+        )
+        token_tracker["verifier_openrouter_cost_estimated_calls"] += int(
+            cost_source == "rate-estimate"
+        )
+        logger.info("[COST | OpenRouter %s] %s cost=$%.10f (%s)",
+                    VERIFY_MODEL, stage_label, call_cost, cost_source)
 
     return _extract_json(content)
 
@@ -987,11 +1150,10 @@ New question: {question}
 Standalone question:"""
 
 
-def rewrite_question(question, history):
-    """Rewrite a follow-up question into a standalone question using chat history."""
+def rewrite_question(question, history, token_tracker=None):
+    """Rewrite a follow-up question using the OpenRouter drafting model."""
     if not history:
         return question
-
     recent = [
         m for m in history[-HISTORY_TURNS:]
         if isinstance(m, dict) and m.get("content")
@@ -999,32 +1161,21 @@ def rewrite_question(question, history):
     ]
     if not recent:
         return question
-
     lines = []
     for m in recent:
         speaker = "User" if m["role"] == "user" else "Assistant"
         text = " ".join(str(m["content"]).split())[:HISTORY_CHARS]
         lines.append(f"{speaker}: {text}")
     prompt = REWRITE_PROMPT.format(history="\n".join(lines), question=question)
-
-    logger.info("[STAGE: REWRITING] Resolving follow-up question context with Ollama (%s)...", DRAFT_MODEL)
+    logger.info("[STAGE: REWRITING] Resolving follow-up question context with OpenRouter (%s)...", DRAFT_MODEL)
     try:
-        res = ollama_client.chat(
-            model=DRAFT_MODEL,
-            messages=[{"role": "user", "content": prompt}],
-            options={"temperature": 0, "num_predict": 768},
+        rewritten = _call_openrouter_text(
+            prompt, DRAFT_MODEL, "question rewrite", token_tracker=token_tracker,
         )
-        rewritten = " ".join(res["message"]["content"].split()).strip().strip('"')
-        in_tok = count_input_tokens(prompt, res.get("prompt_eval_count"))
-        out_tok = count_output_tokens(rewritten, res.get("eval_count"))
-        logger.info(
-            "[TOKENS | Ollama %s] Rewrite finished | input_tokens=%d | output_tokens=%d",
-            DRAFT_MODEL, in_tok, out_tok,
-        )
+        rewritten = " ".join(rewritten.split()).strip().strip('"')
     except Exception:
         logger.exception("Question rewriting failed; using the original question")
         return question
-
     if not rewritten or len(rewritten) > max(300, 4 * len(question)):
         logger.warning("Discarding unusable rewrite: %r", rewritten[:120])
         return question
@@ -1129,18 +1280,36 @@ def answer_question(
     """Run the full pipeline. Returns (final_answer, list_of_source_file_names)."""
     if n_clusters != 2:
         raise ValueError(
-            "The current overlapping-subsets strategy is designed for exactly 2 K-Means clusters."
+            "The chain subset strategy is designed for exactly 2 K-Means clusters."
         )
 
     pipeline_start = time.perf_counter()
     raw_q_tokens = count_question_tokens(question)
     logger.info(
-        "[STAGE 0/4: START] Received question | question_tokens=%d | scope=%s",
-        raw_q_tokens, source or "all documents",
+        "[STAGE 0/4: START] Received question | question_tokens=%d | scope=%s | question=%r",
+        raw_q_tokens, source or "all documents", question,
     )
 
+    token_tracker = {
+        "question_tokens": raw_q_tokens,
+        "embedding_input_tokens": 0,
+        "embedding_cost": 0.0,
+        "embedding_calls": 0,
+        "embedding_provider_reported_cost_calls": 0,
+        "embedding_estimated_cost_calls": 0,
+        "draft_openrouter_input": 0,
+        "draft_openrouter_output": 0,
+        "draft_openrouter_cost": 0.0,
+        "draft_openrouter_cost_provider_reported_calls": 0,
+        "draft_openrouter_cost_estimated_calls": 0,
+        "verifier_openrouter_input": 0,
+        "verifier_openrouter_output": 0,
+        "verifier_openrouter_cost": 0.0,
+        "verifier_openrouter_cost_provider_reported_calls": 0,
+        "verifier_openrouter_cost_estimated_calls": 0,
+    }
     original_question = question
-    question = rewrite_question(question, history)
+    question = rewrite_question(question, history, token_tracker=token_tracker)
     if question != original_question:
         rewritten_q_tokens = count_question_tokens(question)
         logger.info(
@@ -1149,20 +1318,12 @@ def answer_question(
         )
 
     final_q_tokens = count_question_tokens(question)
-    token_tracker = {
-        "question_tokens": final_q_tokens,
-        "ollama_input": 0,
-        "ollama_output": 0,
-        "openrouter_input": 0,
-        "openrouter_output": 0,
-    }
-
     logger.info(
         "[STAGE 1/4: RETRIEVING] Embedding question (%d tokens) and searching ChromaDB for top-k=%d chunks (scope=%s)...",
         final_q_tokens, k, source or "all documents",
     )
     docs, metas, embs, distances = retrieve(
-        question, k=k, return_distances=True, source=source
+        question, k=k, return_distances=True, source=source, token_tracker=token_tracker
     )
     if not docs and source:
         logger.warning("No chunks found for document %r", source)
@@ -1182,7 +1343,7 @@ def answer_question(
     trace_retrieval(docs, metas, distances, k)
 
     logger.info(
-        "[STAGE 2/4: CLUSTERING & SUBSETS] Retrieved %d chunks. Running K-Means (clusters=%d) and building %d overlapping subsets...",
+        "[STAGE 2/4: CLUSTERING & CHAIN SUBSETS] Retrieved %d chunks. Running K-Means (clusters=%d) and building %d chain-overlapping subsets...",
         len(docs), n_clusters, n_subsets,
     )
     labels = cluster(embs, n_clusters=n_clusters)
@@ -1202,8 +1363,7 @@ def answer_question(
     positions = trace_subsets(docs, labels, subsets)
 
     logger.info(
-        "[STAGE 3/4: DRAFTING] Generating %d drafts (%d chunks/subset) with Ollama (%s). "
-        "Please wait — this might take a few minutes depending on local hardware...",
+        "[STAGE 3/4: DRAFTING] Generating %d drafts (%d chunks/subset) with OpenRouter (%s)...",
         len(subsets), len(subsets[0]), DRAFT_MODEL,
     )
     with ThreadPoolExecutor(max_workers=len(subsets)) as pool:
@@ -1239,29 +1399,42 @@ def answer_question(
     )
     logger.info(
         "[TOKEN SUMMARY] question_tokens=%d | final_answer_tokens=%d | "
-        "Ollama (%s): input_tokens=%d, output_tokens=%d | "
-        "OpenRouter (%s): input_tokens=%d, output_tokens=%d",
-        token_tracker["question_tokens"],
-        final_answer_tokens,
-        DRAFT_MODEL,
-        token_tracker["ollama_input"],
-        token_tracker["ollama_output"],
-        VERIFY_MODEL,
-        token_tracker["openrouter_input"],
-        token_tracker["openrouter_output"],
+        "OpenRouter drafting (%s): input_tokens=%d, output_tokens=%d | "
+        "OpenRouter verification (%s): input_tokens=%d, output_tokens=%d",
+        token_tracker["question_tokens"], final_answer_tokens,
+        DRAFT_MODEL, token_tracker["draft_openrouter_input"], token_tracker["draft_openrouter_output"],
+        VERIFY_MODEL, token_tracker["verifier_openrouter_input"], token_tracker["verifier_openrouter_output"],
     )
 
-    input_cost, output_cost, total_cost = calculate_cost(
-        token_tracker["openrouter_input"], token_tracker["openrouter_output"]
+    draft_input_cost, draft_output_cost, _ = calculate_cost(
+        token_tracker["draft_openrouter_input"], token_tracker["draft_openrouter_output"],
+        DRAFT_INPUT_PRICE_PER_M, DRAFT_OUTPUT_PRICE_PER_M,
     )
+    verify_input_cost, verify_output_cost, _ = calculate_cost(
+        token_tracker["verifier_openrouter_input"], token_tracker["verifier_openrouter_output"],
+        OPENROUTER_INPUT_PRICE_PER_M, OPENROUTER_OUTPUT_PRICE_PER_M,
+    )
+    draft_total_cost = token_tracker["draft_openrouter_cost"]
+    verify_total_cost = token_tracker["verifier_openrouter_cost"]
+    embedding_total_cost = token_tracker["embedding_cost"]
     logger.info(
-        "[COST SUMMARY] OpenRouter (%s): input $%.8f (%d tokens x $%.2f/1M) | "
-        "output $%.8f (%d tokens x $%.2f/1M) | TOTAL $%.8f | Ollama (%s): $0.00 (local)",
-        VERIFY_MODEL,
-        input_cost, token_tracker["openrouter_input"], OPENROUTER_INPUT_PRICE_PER_M,
-        output_cost, token_tracker["openrouter_output"], OPENROUTER_OUTPUT_PRICE_PER_M,
-        total_cost,
-        DRAFT_MODEL,
+        "[COST SUMMARY] Drafting (%s): tokens-based input=$%.8f + output=$%.8f; "
+        "charged/estimated total=$%.10f (provider-reported calls=%d, estimated calls=%d) | "
+        "Verification (%s): tokens-based input=$%.8f + output=$%.8f; "
+        "charged/estimated total=$%.10f (provider-reported calls=%d, estimated calls=%d) | "
+        "Embeddings (%s): input_tokens=%d | cost=$%.10f "
+        "(provider-reported calls=%d, estimated calls=%d) | "
+        "TOTAL=$%.10f USD",
+        DRAFT_MODEL, draft_input_cost, draft_output_cost, draft_total_cost,
+        token_tracker["draft_openrouter_cost_provider_reported_calls"],
+        token_tracker["draft_openrouter_cost_estimated_calls"],
+        VERIFY_MODEL, verify_input_cost, verify_output_cost, verify_total_cost,
+        token_tracker["verifier_openrouter_cost_provider_reported_calls"],
+        token_tracker["verifier_openrouter_cost_estimated_calls"],
+        EMBED_MODEL, token_tracker["embedding_input_tokens"], embedding_total_cost,
+        token_tracker["embedding_provider_reported_cost_calls"],
+        token_tracker["embedding_estimated_cost_calls"],
+        draft_total_cost + verify_total_cost + embedding_total_cost,
     )
     return final_answer, sources
 
@@ -1285,10 +1458,9 @@ if __name__ == "__main__":
     build_index()
     logger.info("Speculative RAG ready")
     print(
-        "Speculative RAG ready. Defaults: retrieve 20 chunks, 2 K-Means clusters, "
-        "5 overlapping subsets, 4 chunks per subset (2 from each cluster)."
+        f"Speculative RAG ready. Defaults: retrieve {DEFAULT_RETRIEVAL_K} chunks, "
+        f"{DEFAULT_N_CLUSTERS} K-Means clusters, {DEFAULT_N_SUBSETS} chain-overlapping subsets."
     )
-    print("Subset overlap: embedding-guided similarity chains (70% cosine similarity, 30% question relevance).")
     print("Type 'exit' or 'quit' to stop.")
     cli_history = []
     while True:

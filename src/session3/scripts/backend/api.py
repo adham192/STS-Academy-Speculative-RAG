@@ -27,8 +27,8 @@ logger = logging.getLogger("backend.api")
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    # Importing the engine validates the provider settings in .env (it raises if any are
-    # missing, exactly as before) and sets up the Ollama / OpenRouter clients.
+    # Importing the engine validates the provider settings in .env and configures
+    # the OpenRouter drafting, verification, and embedding clients.
     import Speculative_RAG as rag
 
     database.init_db()                  # logs and carries on if PostgreSQL is not up yet

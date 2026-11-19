@@ -29,3 +29,5 @@ def _positive_int(name, default):
 
 
 CACHE_TTL_SECONDS = _positive_int("CACHE_TTL_SECONDS", 3600)
+# Questions/answers written to the logs are cut to this many characters (one log line each).
+LOG_TEXT_MAX_CHARS = _positive_int("LOG_TEXT_MAX_CHARS", 2000)
