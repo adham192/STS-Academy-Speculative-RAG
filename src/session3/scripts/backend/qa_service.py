@@ -158,6 +158,7 @@ class QAService:
     def ask(self, question, history=None, document=None, top_k=20, n_subsets=5) -> Answer:
         started = time.perf_counter()
         question = question.strip()
+        logger.info("Received question: %r", question)
         scope = document or ""
         logger.info(
             "[QA] Question received | scope=%s | question=%r",
@@ -200,6 +201,7 @@ class QAService:
             answer, sources = self.rag.answer_question(
                 standalone, k=top_k, n_subsets=n_subsets, history=None, source=document,
             )
+            logger.info("Answered from %s for question %r", SOURCE_PIPELINE, question)
             return Answer(answer, SOURCE_PIPELINE, list(sources))
 
         if not cacheable:
