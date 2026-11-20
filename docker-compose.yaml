@@ -15,6 +15,7 @@ services:
       - chroma_data:/app/src/session3/chroma_db   # vector index survives rebuilds
       - pdf_data:/app/src/session3/pdfs
       - ./src/session3/app.log:/app/src/session3/app.log
+      - ./src/session3/JSON-Test-cases:/app/src/session3/JSON-Test-cases:ro
     depends_on:
       postgres:
         condition: service_healthy

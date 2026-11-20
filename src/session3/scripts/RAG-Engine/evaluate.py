@@ -106,9 +106,10 @@ from Speculative_RAG import (  # noqa: E402
     VERIFY_MODEL,
 )
 
-EVAL_PATH = SESSION_DIR / "JSON-Test-cases/ground_truth.json"
+EVAL_PATH = SESSION_DIR / "JSON-Test-cases/cluster_comparison_ground_truth.json"
 RESULTS_PATH = SESSION_DIR / "JSON-evaluation-results/eval_results.json"
 REPORT_PATH = RESULTS_PATH.with_name("eval_report.md")
+COMPARISON_REPORT_PATH = RESULTS_PATH.with_name("pipeline_comparison_results.md")
 RESULTS_PATH.parent.mkdir(parents=True, exist_ok=True)
 
 K = DEFAULT_RETRIEVAL_K
@@ -304,6 +305,25 @@ def sign_test_p(wins, losses):
 def positions_of(docs, subsets):
     return [[docs.index(doc) + 1 for doc in subset] for subset in subsets]
 
+def groups_by_cluster(docs, labels):
+    cluster_ids = sorted({int(label) for label in labels})
+    groups = [
+        [
+            doc
+            for doc, label in zip(docs, labels)
+            if int(label) == cluster_id
+        ]
+        for cluster_id in cluster_ids
+    ]
+    positions = [
+        [
+            index
+            for index, label in enumerate(labels, start=1)
+            if int(label) == cluster_id
+        ]
+        for cluster_id in cluster_ids
+    ]
+    return groups, positions
 
 def cluster_sizes(labels):
     return {str(int(l)): int(sum(int(x) == int(l) for x in labels)) for l in sorted(set(labels))}
@@ -369,6 +389,23 @@ def score_speculative(item, subsets, positions, generated, construction_seconds,
         **structure,
         "subset_construction_seconds": construction_seconds,
         "draft_and_verification_seconds": generation_seconds,
+    }
+
+def score_cluster_direct(item, generated, positions, seconds):
+    return {
+        "status": "ok",
+        "answer": generated["answer"],
+        "draft_answers": [draft_item["answer"] for draft_item in generated["drafts"]],
+        "verifier_scores": generated["scores"],
+        "best_draft_index": generated["best_draft_index"],
+        "final_correct": matches_item(generated["answer"], item),
+        "oracle_draft_correct": any(
+            matches_item(draft_item["answer"], item)
+            for draft_item in generated["drafts"]
+        ),
+        "answer_concept_recall": concept_coverage(generated["answer"], item),
+        "cluster_positions": positions,
+        "seconds": seconds,
     }
 
 
@@ -561,6 +598,7 @@ def score_one_question(item, k, subsets_only):
         return {**base, "status": "no_retrieval"}
 
     labels = cluster(embeddings, n_clusters=N_CLUSTERS)
+    cluster_groups, cluster_positions = groups_by_cluster(docs, labels)
 
     rm = retrieval_metrics(docs, item, retrieval_cutoffs(len(docs)))
     retrieval_rank = rm["first_answer_bearing_rank"] or 0
@@ -630,6 +668,15 @@ def score_one_question(item, k, subsets_only):
             item, subsets, positions, generated, construct_sec, seconds_spec, structure
         )
     spec = record["speculative_rag"]
+    started = time.perf_counter()
+    cluster_generated = run_drafts_and_verification(
+        question, cluster_groups, token_tracker=token_tracker
+    )
+    cluster_seconds = time.perf_counter() - started
+
+    record["cluster_direct_rag"] = score_cluster_direct(
+        item, cluster_generated, cluster_positions, cluster_seconds
+    )
 
     # --- Plain RAG baseline ---------------------------------------------- #
     started = time.perf_counter()
@@ -919,6 +966,96 @@ def build_report(results, k, subsets_only):
     return "\n".join(out)
 
 
+
+def format_draft_lines(result):
+    lines = []
+    for number, (answer, score) in enumerate(
+        zip(result.get("draft_answers", []), result.get("verifier_scores", [])),
+        start=1,
+    ):
+        lines.extend([
+            f"- **Draft {number}** — verifier score: {score}",
+            f"  {answer}",
+        ])
+    return lines
+
+
+def build_pipeline_comparison_report(results):
+    completed = [
+        row for row in results
+        if row.get("status") == "ok"
+        and row.get("cluster_direct_rag", {}).get("status") == "ok"
+    ]
+
+    total_questions = len(json.loads(EVAL_PATH.read_text(encoding="utf-8")))
+    lines = [
+        "# Pipeline Comparison Results",
+        "",
+        "Existing method: 5 subset drafts.",
+        "Cluster-direct method: 2 drafts, one per cluster.",
+        f"Completed comparisons: {len(completed)} of {total_questions} ground-truth questions.",
+        "",
+    ]
+
+    if not completed:
+        lines.append("No completed comparison results.")
+        return "\n".join(lines)
+
+    subset_accuracy = mean(
+        row["speculative_rag"]["final_correct"] for row in completed
+    )
+    cluster_accuracy = mean(
+        row["cluster_direct_rag"]["final_correct"] for row in completed
+    )
+    subset_seconds = mean(
+        row["speculative_rag"]["draft_and_verification_seconds"]
+        for row in completed
+    )
+    cluster_seconds = mean(
+        row["cluster_direct_rag"]["seconds"] for row in completed
+    )
+
+    lines.extend([
+        "## Summary",
+        "",
+        md_table(
+            ["Method", "Final accuracy", "Average draft and verifier seconds"],
+            [
+                ["5 subset drafts", pct(subset_accuracy), f"{subset_seconds:.1f}"],
+                ["2 cluster drafts", pct(cluster_accuracy), f"{cluster_seconds:.1f}"],
+            ],
+        ),
+        "",
+        "## Results by question",
+        "",
+    ])
+
+    for row in completed:
+        subset = row["speculative_rag"]
+        cluster_result = row["cluster_direct_rag"]
+
+        lines.extend([
+            f"### {row.get('id', '')}: {row['question']}",
+            "",
+            f"Reference answer: {row['ground_truth']}",
+            "",
+            "#### 5 subset drafts",
+            "",
+            f"- Final answer: {subset.get('answer', 'N/A')}",
+            f"- Correct: {subset.get('final_correct', False)}",
+            *format_draft_lines(subset),
+            "",
+            "#### 2 cluster drafts",
+            "",
+            f"- Final answer: {cluster_result['answer']}",
+            f"- Correct: {cluster_result['final_correct']}",
+            *format_draft_lines(cluster_result),
+            "",
+        ])
+
+    return "\n".join(lines)
+
+
 # --------------------------------------------------------------------------- #
 # Main
 # --------------------------------------------------------------------------- #
@@ -1004,8 +1141,11 @@ def evaluate():
 
     report = build_report(results, args.k, args.subsets_only)
     REPORT_PATH.write_text(report, encoding="utf-8")
+    comparison_report = build_pipeline_comparison_report(results)
+    COMPARISON_REPORT_PATH.write_text(comparison_report, encoding="utf-8")
     print("\n" + report)
     print(f"\nDetailed results: {RESULTS_PATH}\nReadable report : {REPORT_PATH}")
+    print(f"Pipeline comparison: {COMPARISON_REPORT_PATH}")
     if TRACE:
         print(f"Full trace      : {TRACE_PATH}")
     if TRACE_RETRIEVAL_EVAL:
