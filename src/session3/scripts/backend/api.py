@@ -18,6 +18,14 @@ for path in (HERE, RAG_DIR):
     if str(path) not in sys.path:
         sys.path.insert(0, str(path))
 
+SRC_DIR = HERE.parents[2]
+if str(SRC_DIR) not in sys.path:
+    sys.path.insert(0, str(SRC_DIR))
+
+from logging_config import setup_logging
+
+setup_logging(HERE.parents[1])
+
 import cache  # noqa: E402
 import database  # noqa: E402
 from qa_service import QAService  # noqa: E402
