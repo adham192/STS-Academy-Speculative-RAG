@@ -50,6 +50,23 @@ load_dotenv()
 OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY")
 EMBED_MODEL = os.getenv("OPENROUTER_MODEL")
 DRAFT_MODEL = os.getenv("DRAFT_MODEL", "qwen/qwen3.5-9b").strip()
+# Reasoning control for the DRAFT model only (no token limit is applied).
+#   DRAFT_REASONING unset / "default" -> send nothing, the model decides (previous behaviour)
+#   DRAFT_REASONING=off               -> ask OpenRouter to disable reasoning
+#   DRAFT_REASONING=low|medium|high   -> ask for that reasoning effort
+# OpenRouter passes this on only if the model/provider supports it; check the logged
+# output_tokens of the drafts to see whether it had an effect.
+DRAFT_REASONING = os.getenv("DRAFT_REASONING", "default").strip().lower() or "default"
+_REASONING_PARAMS = {
+    "off": {"enabled": False}, "none": {"enabled": False}, "false": {"enabled": False},
+    "minimal": {"effort": "minimal"}, "low": {"effort": "low"},
+    "medium": {"effort": "medium"}, "high": {"effort": "high"},
+}
+if DRAFT_REASONING != "default" and DRAFT_REASONING not in _REASONING_PARAMS:
+    raise SystemExit(
+        f"DRAFT_REASONING={DRAFT_REASONING!r} is not valid. Use default, off, minimal, low, medium or high."
+    )
+DRAFT_REASONING_PARAM = _REASONING_PARAMS.get(DRAFT_REASONING)
 OPENROUTER_CHAT_API_KEY = os.getenv("api-key")  # shared by drafting and verification
 VERIFY_MODEL = os.getenv("model")          # OpenRouter model id, e.g. qwen/qwen3.7-flash
 
@@ -683,7 +700,8 @@ If the documents do not contain the answer, say so in the answer.
 """
 
 
-def _call_openrouter_text(prompt, model, stage_label, token_tracker=None, json_mode=False):
+def _call_openrouter_text(prompt, model, stage_label, token_tracker=None, json_mode=False,
+                          reasoning=None):
     """Call an OpenRouter chat model and return its text response."""
     payload = {
         "model": model,
@@ -693,6 +711,8 @@ def _call_openrouter_text(prompt, model, stage_label, token_tracker=None, json_m
     if json_mode:
         payload["response_format"] = {"type": "json_object"}
     payload["usage"] = {"include": True}
+    if reasoning:
+        payload["reasoning"] = reasoning
 
     response = None
     started = time.perf_counter()
@@ -736,6 +756,14 @@ def _call_openrouter_text(prompt, model, stage_label, token_tracker=None, json_m
     except (KeyError, IndexError, TypeError, AttributeError) as error:
         raise ValueError(f"Unexpected OpenRouter response: {str(body)[:200]}") from error
     if not isinstance(content, str) or not content.strip():
+        choice = body["choices"][0]
+        logger.error(
+            "[EMPTY RESPONSE] %s | model=%s | finish_reason=%s | completion_tokens=%s | "
+            "reasoning_chars=%d | reasoning_setting=%s",
+            stage_label, model, choice.get("finish_reason"),
+            (body.get("usage") or {}).get("completion_tokens"),
+            len(str(choice["message"].get("reasoning") or "")), reasoning,
+        )
         raise ValueError(f"OpenRouter returned an empty response for {stage_label}")
 
     usage = body.get("usage") or {}
@@ -771,6 +799,7 @@ def draft(question, subset, draft_idx=None, token_tracker=None):
     logger.debug("Calling OpenRouter drafting model %s for %s with %d chunks", DRAFT_MODEL, label, len(subset))
     raw = _call_openrouter_text(
         prompt, DRAFT_MODEL, label, token_tracker=token_tracker, json_mode=True,
+        reasoning=DRAFT_REASONING_PARAM,
     )
     try:
         data = _extract_json(raw)
@@ -1286,8 +1315,8 @@ def answer_question(
             "The chain subset strategy is designed for exactly 2 K-Means clusters."
         )
 
-    if strategy not in {"subsets", "clusters"}:
-        raise ValueError("strategy must be 'subsets' or 'clusters'.")
+    if strategy != "subsets":
+        raise ValueError("Only the 'subsets' strategy is supported.")
 
     pipeline_start = time.perf_counter()
     raw_q_tokens = count_question_tokens(question)
@@ -1360,35 +1389,15 @@ def answer_question(
     )
     trace_clusters(docs, labels)
 
-    if strategy == "subsets":
-        evidence_groups = build_subsets(
-            docs,
-            labels,
-            n_subsets=n_subsets,
-            distances=distances,
-            embeddings=embs,
-        )
-        positions = trace_subsets(docs, labels, evidence_groups)
-        group_name = "subset"
-    else:
-        cluster_ids = sorted({int(label) for label in labels})
-        evidence_groups = [
-            [
-                doc
-                for doc, label in zip(docs, labels)
-                if int(label) == cluster_id
-            ]
-            for cluster_id in cluster_ids
-        ]
-        positions = [
-            [
-                index
-                for index, label in enumerate(labels, start=1)
-                if int(label) == cluster_id
-            ]
-            for cluster_id in cluster_ids
-        ]
-        group_name = "cluster"
+    evidence_groups = build_subsets(
+        docs,
+        labels,
+        n_subsets=n_subsets,
+        distances=distances,
+        embeddings=embs,
+    )
+    positions = trace_subsets(docs, labels, evidence_groups)
+    group_name = "subset"
 
     logger.info(
         "[STAGE 3/4: DRAFTING] Generating %d drafts, one per %s...",

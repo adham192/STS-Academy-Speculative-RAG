@@ -52,6 +52,8 @@ Outputs (in JSON-evaluation-results/)
 Usage
   python evaluate.py                   # full evaluation
   python evaluate.py --subsets-only    # no LLM calls: inspect clusters/subsets
+  python evaluate.py --ground-truth PATH  # use another ground-truth json (default: the
+                                       # file in JSON-Test-cases/, ALL its questions)
   python evaluate.py --k 8             # fewer chunks
   python evaluate.py --ids E01 H02     # only some questions
   python evaluate.py --levels hard     # only some levels
@@ -103,13 +105,13 @@ from Speculative_RAG import (  # noqa: E402
     DEFAULT_N_CLUSTERS,
     DEFAULT_N_SUBSETS,
     DRAFT_MODEL,
+    DRAFT_REASONING,
     VERIFY_MODEL,
 )
 
 EVAL_PATH = SESSION_DIR / "JSON-Test-cases/cluster_comparison_ground_truth.json"
 RESULTS_PATH = SESSION_DIR / "JSON-evaluation-results/eval_results.json"
 REPORT_PATH = RESULTS_PATH.with_name("eval_report.md")
-COMPARISON_REPORT_PATH = RESULTS_PATH.with_name("pipeline_comparison_results.md")
 RESULTS_PATH.parent.mkdir(parents=True, exist_ok=True)
 
 K = DEFAULT_RETRIEVAL_K
@@ -164,14 +166,31 @@ def matches_item(text, item):
     return True
 
 
-def run_drafts_and_verification(question, subsets, token_tracker=None):
-    """Write one draft per subset with OpenRouter, then verify them with OpenRouter."""
+VERIFIER_DOWN_MARKERS = ("verifier quota is exhausted", "resource_exhausted", "verifier model")
+
+
+def stage(progress, method, text):
+    """Always-visible stage line: which method (SUBSETS / PLAIN RAG) the model is
+    working on right now. Goes to the terminal and the app log (so also to
+    `docker compose logs`); it is NOT written to eval_trace.md or eval_retrieval_trace.md."""
+    line = f">>> {progress}[{method}] {text}"
+    print("  " + line, flush=True)
+    logger.info(line)
+
+
+def run_drafts_and_verification(question, subsets, token_tracker=None, method=None, progress=""):
+    """Write one draft per evidence group with OpenRouter, then verify them with OpenRouter.
+    `method` only controls the stage lines that are printed (e.g. "SUBSETS")."""
+    if method:
+        stage(progress, method, f"STAGE 1/2 drafting: {len(subsets)} drafts in parallel ...")
     with ThreadPoolExecutor(max_workers=len(subsets)) as pool:
         futures = [
             pool.submit(draft, question, subset, i + 1, token_tracker)
             for i, subset in enumerate(subsets)
         ]
         drafts = [f.result() for f in futures]
+    if method:
+        stage(progress, method, f"STAGE 2/2 verifying: scoring {len(drafts)} drafts ...")
     scores, best, tie_reason, final_answer = verify(
         question, drafts, subsets, token_tracker=token_tracker
     )
@@ -305,25 +324,6 @@ def sign_test_p(wins, losses):
 def positions_of(docs, subsets):
     return [[docs.index(doc) + 1 for doc in subset] for subset in subsets]
 
-def groups_by_cluster(docs, labels):
-    cluster_ids = sorted({int(label) for label in labels})
-    groups = [
-        [
-            doc
-            for doc, label in zip(docs, labels)
-            if int(label) == cluster_id
-        ]
-        for cluster_id in cluster_ids
-    ]
-    positions = [
-        [
-            index
-            for index, label in enumerate(labels, start=1)
-            if int(label) == cluster_id
-        ]
-        for cluster_id in cluster_ids
-    ]
-    return groups, positions
 
 def cluster_sizes(labels):
     return {str(int(l)): int(sum(int(x) == int(l) for x in labels)) for l in sorted(set(labels))}
@@ -390,24 +390,6 @@ def score_speculative(item, subsets, positions, generated, construction_seconds,
         "subset_construction_seconds": construction_seconds,
         "draft_and_verification_seconds": generation_seconds,
     }
-
-def score_cluster_direct(item, generated, positions, seconds):
-    return {
-        "status": "ok",
-        "answer": generated["answer"],
-        "draft_answers": [draft_item["answer"] for draft_item in generated["drafts"]],
-        "verifier_scores": generated["scores"],
-        "best_draft_index": generated["best_draft_index"],
-        "final_correct": matches_item(generated["answer"], item),
-        "oracle_draft_correct": any(
-            matches_item(draft_item["answer"], item)
-            for draft_item in generated["drafts"]
-        ),
-        "answer_concept_recall": concept_coverage(generated["answer"], item),
-        "cluster_positions": positions,
-        "seconds": seconds,
-    }
-
 
 def failed_speculative(error):
     return {
@@ -577,7 +559,7 @@ def begin_trace_file(path, title):
         file.write(f"\n## Run started {time.strftime('%Y-%m-%d %H:%M:%S')}\n\n")
 
 
-def score_one_question(item, k, subsets_only):
+def score_one_question(item, k, subsets_only, progress=""):
     question = item["question"]
     source = item.get("source") or None
     q_tokens = count_question_tokens(question)
@@ -598,7 +580,6 @@ def score_one_question(item, k, subsets_only):
         return {**base, "status": "no_retrieval"}
 
     labels = cluster(embeddings, n_clusters=N_CLUSTERS)
-    cluster_groups, cluster_positions = groups_by_cluster(docs, labels)
 
     rm = retrieval_metrics(docs, item, retrieval_cutoffs(len(docs)))
     retrieval_rank = rm["first_answer_bearing_rank"] or 0
@@ -607,6 +588,8 @@ def score_one_question(item, k, subsets_only):
     emit_retrieval(retrieval_trace_lines(item, docs, metas, distances, rm))
     trace_clusters(docs, labels)
 
+    if not subsets_only:
+        stage(progress, "SUBSETS", f"building {N_SUBSETS} chain subsets from the K-Means clusters ...")
     subsets, construct_sec, error_msg = build_subsets_timed(docs, labels, distances, embeddings)
     positions = positions_of(docs, subsets) if subsets else None
     if subsets:
@@ -660,27 +643,41 @@ def score_one_question(item, k, subsets_only):
         record["speculative_rag"] = failed_speculative(error_msg)
     else:
         structure = subset_structure(positions, embeddings, distances)
-        started = time.perf_counter()
-        generated = run_drafts_and_verification(question, subsets, token_tracker=token_tracker)
-        seconds_spec = time.perf_counter() - started
-        trace_generation(generated, positions)
-        record["speculative_rag"] = score_speculative(
-            item, subsets, positions, generated, construct_sec, seconds_spec, structure
-        )
+        try:
+            started = time.perf_counter()
+            generated = run_drafts_and_verification(
+                question, subsets, token_tracker=token_tracker, method="SUBSETS", progress=progress
+            )
+            seconds_spec = time.perf_counter() - started
+            trace_generation(generated, positions)
+            record["speculative_rag"] = score_speculative(
+                item, subsets, positions, generated, construct_sec, seconds_spec, structure
+            )
+        except Exception as error:
+            # A failed subsets run must not stop the plain-RAG stage.
+            if any(t in str(error).lower() for t in VERIFIER_DOWN_MARKERS):
+                raise
+            logger.exception("Subsets run failed for %s", item.get("id"))
+            record["speculative_rag"] = failed_speculative(f"{type(error).__name__}: {error}")
     spec = record["speculative_rag"]
-    started = time.perf_counter()
-    cluster_generated = run_drafts_and_verification(
-        question, cluster_groups, token_tracker=token_tracker
-    )
-    cluster_seconds = time.perf_counter() - started
-
-    record["cluster_direct_rag"] = score_cluster_direct(
-        item, cluster_generated, cluster_positions, cluster_seconds
-    )
+    if spec.get("status") == "ok":
+        stage(progress, "SUBSETS", f"DONE in {construct_sec + spec['draft_and_verification_seconds']:.1f}s "
+              f"-> {'CORRECT' if spec['final_correct'] else 'wrong'}")
+    else:
+        stage(progress, "SUBSETS", f"FAILED: {spec.get('error')}")
 
     # --- Plain RAG baseline ---------------------------------------------- #
+    stage(progress, "PLAIN RAG", "STAGE 1/1 drafting from all retrieved chunks ...")
     started = time.perf_counter()
-    baseline_answer = draft(question, docs, draft_idx="baseline", token_tracker=token_tracker)["answer"]
+    try:
+        baseline_answer = draft(question, docs, draft_idx="baseline", token_tracker=token_tracker)["answer"]
+        baseline_error = None
+    except Exception as error:
+        if any(t in str(error).lower() for t in VERIFIER_DOWN_MARKERS):
+            raise
+        logger.exception("Plain RAG failed for %s", item.get("id"))
+        baseline_answer, baseline_error = "", f"{type(error).__name__}: {error}"
+        stage(progress, "PLAIN RAG", f"FAILED: {error}")
     emit(lambda full: ["", "  == PLAIN RAG (all retrieved chunks in one prompt) ==",
                        f"  Answer: {_clip(baseline_answer, full)}"])
     record["baseline"] = {
@@ -688,6 +685,7 @@ def score_one_question(item, k, subsets_only):
         "correct": matches_item(baseline_answer, item),
         "answer_concept_recall": concept_coverage(baseline_answer, item),
         "seconds": time.perf_counter() - started,
+        **({"status": "error", "error": baseline_error} if baseline_error else {}),
     }
 
     logger.info(
@@ -967,100 +965,11 @@ def build_report(results, k, subsets_only):
 
 
 
-def format_draft_lines(result):
-    lines = []
-    for number, (answer, score) in enumerate(
-        zip(result.get("draft_answers", []), result.get("verifier_scores", [])),
-        start=1,
-    ):
-        lines.extend([
-            f"- **Draft {number}** — verifier score: {score}",
-            f"  {answer}",
-        ])
-    return lines
-
-
-def build_pipeline_comparison_report(results):
-    completed = [
-        row for row in results
-        if row.get("status") == "ok"
-        and row.get("cluster_direct_rag", {}).get("status") == "ok"
-    ]
-
-    total_questions = len(json.loads(EVAL_PATH.read_text(encoding="utf-8")))
-    lines = [
-        "# Pipeline Comparison Results",
-        "",
-        "Existing method: 5 subset drafts.",
-        "Cluster-direct method: 2 drafts, one per cluster.",
-        f"Completed comparisons: {len(completed)} of {total_questions} ground-truth questions.",
-        "",
-    ]
-
-    if not completed:
-        lines.append("No completed comparison results.")
-        return "\n".join(lines)
-
-    subset_accuracy = mean(
-        row["speculative_rag"]["final_correct"] for row in completed
-    )
-    cluster_accuracy = mean(
-        row["cluster_direct_rag"]["final_correct"] for row in completed
-    )
-    subset_seconds = mean(
-        row["speculative_rag"]["draft_and_verification_seconds"]
-        for row in completed
-    )
-    cluster_seconds = mean(
-        row["cluster_direct_rag"]["seconds"] for row in completed
-    )
-
-    lines.extend([
-        "## Summary",
-        "",
-        md_table(
-            ["Method", "Final accuracy", "Average draft and verifier seconds"],
-            [
-                ["5 subset drafts", pct(subset_accuracy), f"{subset_seconds:.1f}"],
-                ["2 cluster drafts", pct(cluster_accuracy), f"{cluster_seconds:.1f}"],
-            ],
-        ),
-        "",
-        "## Results by question",
-        "",
-    ])
-
-    for row in completed:
-        subset = row["speculative_rag"]
-        cluster_result = row["cluster_direct_rag"]
-
-        lines.extend([
-            f"### {row.get('id', '')}: {row['question']}",
-            "",
-            f"Reference answer: {row['ground_truth']}",
-            "",
-            "#### 5 subset drafts",
-            "",
-            f"- Final answer: {subset.get('answer', 'N/A')}",
-            f"- Correct: {subset.get('final_correct', False)}",
-            *format_draft_lines(subset),
-            "",
-            "#### 2 cluster drafts",
-            "",
-            f"- Final answer: {cluster_result['answer']}",
-            f"- Correct: {cluster_result['final_correct']}",
-            *format_draft_lines(cluster_result),
-            "",
-        ])
-
-    return "\n".join(lines)
-
-
 # --------------------------------------------------------------------------- #
 # Main
 # --------------------------------------------------------------------------- #
 def evaluate():
-    global N_CLUSTERS, TRACE, TRACE_CHARS
+    global N_CLUSTERS, TRACE, TRACE_CHARS, EVAL_PATH
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawTextHelpFormatter)
     parser.add_argument("--k", type=int, default=K, help=f"chunks to retrieve (default {K})")
     parser.add_argument("--clusters", type=int, default=N_CLUSTERS,
@@ -1070,6 +979,9 @@ def evaluate():
     parser.add_argument("--chunk-chars", type=int, default=TRACE_CHARS,
                         help="clip each chunk to N characters in the terminal (default 0 = show everything). "
                              "The saved trace file always has the full text.")
+    parser.add_argument("--ground-truth", default=str(EVAL_PATH),
+                        help="ground-truth json; every question in it is run unless "
+                             "--ids/--levels/--limit narrow it (default: %(default)s)")
     parser.add_argument("--subsets-only", action="store_true",
                         help="build clusters/subsets but skip all LLM calls")
     parser.add_argument("--ids", nargs="*", help="only these question ids, e.g. E01 H02")
@@ -1084,6 +996,7 @@ def evaluate():
             "build_subsets() first."
         )
     N_CLUSTERS = args.clusters
+    EVAL_PATH = Path(args.ground_truth)
     TRACE, TRACE_CHARS = not args.quiet, args.chunk_chars
     # Traces are appended to, never truncated: earlier runs stay in the files.
     if TRACE:
@@ -1102,8 +1015,10 @@ def evaluate():
     if not items:
         raise SystemExit("No questions selected.")
 
-    print(f"Loaded {len(items)} questions from {EVAL_PATH}")
-    print(f"Retrieval k={args.k}; clusters={N_CLUSTERS}; subsets={N_SUBSETS}")
+    total_in_file = len(json.loads(EVAL_PATH.read_text(encoding="utf-8")))
+    print(f"Loaded {len(items)} of {total_in_file} questions from {EVAL_PATH}")
+    print(f"Retrieval k={args.k}; clusters={N_CLUSTERS}; subsets={N_SUBSETS}; "
+          f"draft model={DRAFT_MODEL}; draft reasoning={DRAFT_REASONING}")
     if not args.subsets_only and MIN_INTERVAL > 0:
         print(f"Verifier pacing: {MIN_INTERVAL:g}s minimum interval between calls.")
 
@@ -1120,16 +1035,16 @@ def evaluate():
     for index, item in enumerate(items, start=1):
         print(f"\n[{index}/{len(items)}] [{item.get('level', '?')}] {item.get('id', '')} "
               f"{item['question']}", flush=True)
+        progress = f"[{index}/{len(items)}] {item.get('id', '')} "
         try:
-            results.append(score_one_question(item, args.k, args.subsets_only))
+            results.append(score_one_question(item, args.k, args.subsets_only, progress))
         except Exception as error:
             logger.exception("Question %s failed", item.get("id"))
             results.append({"id": item.get("id"), "question": item["question"],
                             "level": item.get("level"), "status": "error",
                             "evaluation_error": str(error)})
             text = str(error).lower()
-            if any(t in text for t in ("verifier quota is exhausted", "resource_exhausted",
-                                       "verifier model")):
+            if any(t in text for t in VERIFIER_DOWN_MARKERS):
                 print("Stopping: verifier is unavailable or credits are exhausted.")
                 break
         with open(RESULTS_PATH, "w", encoding="utf-8") as file:
@@ -1141,11 +1056,8 @@ def evaluate():
 
     report = build_report(results, args.k, args.subsets_only)
     REPORT_PATH.write_text(report, encoding="utf-8")
-    comparison_report = build_pipeline_comparison_report(results)
-    COMPARISON_REPORT_PATH.write_text(comparison_report, encoding="utf-8")
     print("\n" + report)
     print(f"\nDetailed results: {RESULTS_PATH}\nReadable report : {REPORT_PATH}")
-    print(f"Pipeline comparison: {COMPARISON_REPORT_PATH}")
     if TRACE:
         print(f"Full trace      : {TRACE_PATH}")
     if TRACE_RETRIEVAL_EVAL:
