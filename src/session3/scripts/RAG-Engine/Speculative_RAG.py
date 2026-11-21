@@ -1253,12 +1253,14 @@ def trace_subsets(docs, labels, subsets):
     return positions
 
 
-def trace_generation(drafts, scores, best, positions, final_answer):
+def trace_generation(drafts, scores, best, positions, final_answer, group_name="subset"):
     lines = ["== DRAFTS AND VERIFICATION =="]
     for n, d in enumerate(drafts):
         mark = "  <== selected" if n == best else ""
-        lines.append(f"Draft {n + 1}  (subset {n + 1}: {_trace_ids(positions[n])})  "
-                     f"verifier score {scores[n]}{mark}")
+        lines.append(
+            f"Draft {n + 1}  ({group_name} {n + 1}: "
+            f"{_trace_ids(positions[n])})  "
+            f"verifier score {scores[n]}{mark}")
         lines.append(f"    Answer   : {_trace_clip(d['answer'])}")
         lines.append(f"    Rationale: {_trace_clip(d['rationale'])}")
     _trace_log(lines)
@@ -1276,12 +1278,16 @@ def answer_question(
     n_clusters=DEFAULT_N_CLUSTERS,
     history=None,
     source=None,
+    strategy="subsets",
 ):
     """Run the full pipeline. Returns (final_answer, list_of_source_file_names)."""
     if n_clusters != 2:
         raise ValueError(
             "The chain subset strategy is designed for exactly 2 K-Means clusters."
         )
+
+    if strategy not in {"subsets", "clusters"}:
+        raise ValueError("strategy must be 'subsets' or 'clusters'.")
 
     pipeline_start = time.perf_counter()
     raw_q_tokens = count_question_tokens(question)
@@ -1353,37 +1359,61 @@ def answer_question(
         ", ".join(f"Cluster {label}: {size}" for label, size in sorted(cluster_sizes.items())),
     )
     trace_clusters(docs, labels)
-    subsets = build_subsets(
-        docs,
-        labels,
-        n_subsets=n_subsets,
-        distances=distances,
-        embeddings=embs,
-    )
-    positions = trace_subsets(docs, labels, subsets)
 
-    logger.info(
-        "[STAGE 3/4: DRAFTING] Generating %d drafts (%d chunks/subset) with OpenRouter (%s)...",
-        len(subsets), len(subsets[0]), DRAFT_MODEL,
-    )
-    with ThreadPoolExecutor(max_workers=len(subsets)) as pool:
-        futures = [
-            pool.submit(draft, question, subset, i + 1, token_tracker)
-            for i, subset in enumerate(subsets)
+    if strategy == "subsets":
+        evidence_groups = build_subsets(
+            docs,
+            labels,
+            n_subsets=n_subsets,
+            distances=distances,
+            embeddings=embs,
+        )
+        positions = trace_subsets(docs, labels, evidence_groups)
+        group_name = "subset"
+    else:
+        cluster_ids = sorted({int(label) for label in labels})
+        evidence_groups = [
+            [
+                doc
+                for doc, label in zip(docs, labels)
+                if int(label) == cluster_id
+            ]
+            for cluster_id in cluster_ids
         ]
-        drafts = [f.result() for f in futures]
+        positions = [
+            [
+                index
+                for index, label in enumerate(labels, start=1)
+                if int(label) == cluster_id
+            ]
+            for cluster_id in cluster_ids
+        ]
+        group_name = "cluster"
 
     logger.info(
-        "[STAGE 4/4: VERIFYING] All %d drafts generated. Sending candidates to OpenRouter (%s) for verification and scoring...",
-        len(drafts), VERIFY_MODEL,
+        "[STAGE 3/4: DRAFTING] Generating %d drafts, one per %s...",
+        len(evidence_groups), group_name,
+    )
+    with ThreadPoolExecutor(max_workers=len(evidence_groups)) as pool:
+        futures = [
+            pool.submit(draft, question, group, index + 1, token_tracker)
+            for index, group in enumerate(evidence_groups)
+        ]
+        drafts = [future.result() for future in futures]
+
+    logger.info(
+        "[STAGE 4/4: VERIFYING] Sending %d drafts for verification...",
+        len(drafts),
     )
     scores, best, tie_reason, final_answer = verify(
-        question, drafts, subsets, token_tracker=token_tracker
+        question, drafts, evidence_groups, token_tracker=token_tracker
     )
 
-    trace_generation(drafts, scores, best, positions, final_answer)
+    trace_generation(drafts, scores, best, positions, final_answer, group_name=group_name)
 
-    for i, (draft_data, score, subset) in enumerate(zip(drafts, scores, subsets), start=1):
+    for i, (draft_data, score, group) in enumerate(
+        zip(drafts, scores, evidence_groups), start=1
+    ):
         logger.debug(
             "Draft %d (score %.1f) answer=%s | rationale=%s",
             i, score, draft_data["answer"], draft_data["rationale"],

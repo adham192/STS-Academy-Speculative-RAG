@@ -1,0 +1,170 @@
+[
+  {
+    "id": "E01",
+    "level": "easy",
+    "topic": "Project overview",
+    "question": "What are the three AI components integrated into the FitStyle AI shopper journey?",
+    "ground_truth": "body measurement and size estimation (Model 1), outfit recommendation engine (Model 2), and virtual try-on (Model 3)",
+    "source": "FitStyle_AI_Documentation_final (1).pdf",
+    "difficulty_rationale": "Direct retrieval of the three main components listed in Table 1.1.",
+    "required_concepts": [
+      ["body measurement", "size estimation"],
+      ["outfit recommendation", "recommendation engine"],
+      ["virtual try-on", "try-on"]
+    ]
+  },
+  {
+    "id": "E02",
+    "level": "easy",
+    "topic": "Platform architecture",
+    "question": "Which AWS service handles user authentication in the FitStyle AI platform?",
+    "ground_truth": "Amazon Cognito",
+    "source": "FitStyle_AI_Documentation_final (1).pdf",
+    "difficulty_rationale": "Direct identification of a named technology choice.",
+    "required_concepts": [
+      ["Amazon Cognito", "Cognito"]
+    ]
+  },
+  {
+    "id": "E03",
+    "level": "easy",
+    "topic": "Catalogue",
+    "question": "How many products does the FitStyle AI catalogue contain, and which clothing sizes does it stock?",
+    "ground_truth": "11,513 products, in sizes S to XL only",
+    "source": "FitStyle_AI_Documentation_final (1).pdf",
+    "difficulty_rationale": "Direct retrieval of two explicit facts from the scope section.",
+    "required_concepts": [
+      ["11,513", "11513"],
+      ["S to XL", "S-XL", "S, M, L and XL", "S, M, L, XL"]
+    ]
+  },
+  {
+    "id": "E04",
+    "level": "easy",
+    "topic": "Virtual try-on hardware",
+    "question": "On what kind of GPU runtime does the virtual try-on model run in this project?",
+    "ground_truth": "a free Google Colab T4 GPU",
+    "source": "FitStyle_AI_Documentation_final (1).pdf",
+    "difficulty_rationale": "Direct retrieval of a single deployment detail.",
+    "required_concepts": [
+      ["Colab"],
+      ["T4"]
+    ]
+  },
+  {
+    "id": "M01",
+    "level": "medium",
+    "topic": "Compatibility network results",
+    "question": "By how much did rebalancing the compatibility network improve held-out accuracy? Give the accuracy of CompatibilityNet v1 and v2.",
+    "ground_truth": "accuracy rose from 0.646 (v1) to 0.789 (v2)",
+    "source": "FitStyle_AI_Documentation_final (1).pdf",
+    "difficulty_rationale": "Requires retrieving and pairing two related numbers from the results.",
+    "required_concepts": [
+      ["0.646"],
+      ["0.789"]
+    ]
+  },
+  {
+    "id": "M02",
+    "level": "medium",
+    "topic": "Ensemble weight",
+    "question": "What weight did the validation split select for the CompatibilityNet in the ensemble, and what does that mean for the final model?",
+    "ground_truth": "the selected weight was 0, so the ensemble reduces to the linear model alone",
+    "source": "FitStyle_AI_Documentation_final (1).pdf",
+    "difficulty_rationale": "Requires stating the selected value and interpreting its consequence.",
+    "required_concepts": [
+      ["weight was 0", "w = 0", "weight of 0", "selected weight 0", "weight 0"],
+      ["linear model"]
+    ]
+  },
+  {
+    "id": "M03",
+    "level": "medium",
+    "topic": "Waist detection fallback",
+    "question": "In Model 1, when does the waist detection fall back to the proportional estimate, and how is the result labelled?",
+    "ground_truth": "when the narrowest point lies outside 0.35 to 0.65 of the torso height; the waist is set at 0.55 of the torso and labelled proportional_fallback with low confidence",
+    "source": "FitStyle_AI_Documentation_final (1).pdf",
+    "difficulty_rationale": "Requires combining the acceptance range, the fallback position and the reported labels.",
+    "required_concepts": [
+      ["0.35"],
+      ["0.65"],
+      ["proportional_fallback", "proportional fallback"],
+      ["low confidence", "confidence low", "\"low\""]
+    ]
+  },
+  {
+    "id": "M04",
+    "level": "medium",
+    "topic": "Pre-computed recommendations",
+    "question": "How many profiles are pre-computed offline for the recommendation engine, and why is this done instead of running the model live?",
+    "ground_truth": "400 profiles (4 sizes x 5 body shapes x 5 occasions x 4 seasons); the neural pipeline needs a GPU and the application should stay within free-tier limits",
+    "source": "FitStyle_AI_Documentation_final (1).pdf",
+    "difficulty_rationale": "Requires retrieving the number of profiles and the design reason behind it.",
+    "required_concepts": [
+      ["400"],
+      ["GPU"],
+      ["free-tier", "free tier"]
+    ]
+  },
+  {
+    "id": "H01",
+    "level": "hard",
+    "topic": "Hip width diagnosis",
+    "question": "Why did the landmark baseline give a hip estimate of 19.5 cm while the segmentation-based method gave 61.9 cm for the same photograph?",
+    "ground_truth": "the hip landmarks are internal joint centres, so their distance is smaller than the body width at the hips; the segmentation method reads the silhouette width at hip height instead",
+    "source": "FitStyle_AI_Documentation_final (1).pdf",
+    "difficulty_rationale": "Requires explaining the cause of a measurement discrepancy, not just quoting the two numbers.",
+    "required_concepts": [
+      ["joint centres", "joint centers", "joint centre", "internal joint"],
+      ["silhouette", "mask"],
+      ["hip height", "at the hips", "width of the body"]
+    ]
+  },
+  {
+    "id": "H02",
+    "level": "hard",
+    "topic": "Outfit scoring and safeguards",
+    "question": "How is the final score of an outfit computed in the recommendation engine, and what two safeguards are applied during selection?",
+    "ground_truth": "final = 0.6 x compatibility + 0.4 x relevance - 0.1 x colour penalty; a compatibility floor of 0.55 removes outfits with a weak pair, and a per-item reuse cap of 2 limits how many accepted outfits can share a product",
+    "source": "FitStyle_AI_Documentation_final (1).pdf",
+    "difficulty_rationale": "Requires synthesizing the scoring formula with two separate safeguards from the same section.",
+    "required_concepts": [
+      ["0.6"],
+      ["0.4"],
+      ["colour penalty", "color penalty"],
+      ["0.55"],
+      ["reuse cap", "reuse of 2", "cap of 2"]
+    ]
+  },
+  {
+    "id": "H03",
+    "level": "hard",
+    "topic": "Try-on pipeline for two-piece outfits",
+    "question": "How does the virtual try-on pipeline handle an outfit made of a top and a bottom, and which stages are added around LaDI-VTON?",
+    "ground_truth": "garment cleaning, person preparation and identity restoration are added around the model; because it changes one clothing region at a time, the bottom is generated first and its result becomes the person image for the top",
+    "source": "FitStyle_AI_Documentation_final (1).pdf",
+    "difficulty_rationale": "Requires combining the added stages with the sequential layering order.",
+    "required_concepts": [
+      ["garment cleaning"],
+      ["person preparation"],
+      ["identity restoration"],
+      ["bottom first", "bottom is processed first", "bottom, then the top", "bottom first and the top second"],
+      ["one clothing region at a time", "one region at a time", "result of the first step becomes the person image", "second step starts from the result of the first"]
+    ]
+  },
+  {
+    "id": "H04",
+    "level": "hard",
+    "topic": "Interpretation of compatibility accuracy",
+    "question": "Why does the report say the 0.932 accuracy should not be attributed to the neural network, and what does the metadata-only accuracy of 0.928 suggest about the labels?",
+    "ground_truth": "0.932 is the linear model's own performance because the ensemble weight was 0; metadata-only reaching 0.928 suggests the proxy labels depend mainly on category and colour",
+    "source": "FitStyle_AI_Documentation_final (1).pdf",
+    "difficulty_rationale": "Requires connecting the ensemble result with the ablation result to interpret what the accuracy actually measures.",
+    "required_concepts": [
+      ["linear model"],
+      ["weight was 0", "w = 0", "weight of 0", "weight 0"],
+      ["0.928", "metadata-only", "metadata only"],
+      ["category and colour", "category and color", "proxy labels"]
+    ]
+  }
+]
