@@ -119,6 +119,17 @@ api-key=your-gemini-key
 model=your-gemini-model
 ```
 
+To configure a separate Arabic embedding and multilingual generation pipeline:
+
+```ini
+ARABIC_EMBED_MODEL=your-arabic-embedding-model
+ARABIC_EMBEDDING_INPUT_PRICE_PER_M=0.02
+```
+
+These variables are optional: without them, Arabic uses the existing draft and verifier models,
+and falls back to `OPENROUTER_MODEL` for embeddings. Questions are detected as Arabic or English;
+Arabic questions retrieve only from `arabic_docs`, while English questions retrieve from `docs`.
+
 Never commit `.env` files to git.
 
 ### 5. Start Ollama and pull the model

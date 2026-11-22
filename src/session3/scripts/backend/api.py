@@ -108,15 +108,15 @@ def list_documents():
 
 @app.post("/documents")
 def upload_document(file: UploadFile = File(...)):
-    """Save an uploaded PDF and index it (same steps the Streamlit sidebar did before)."""
+    """Save an uploaded PDF or Parquet document and index it."""
     name = Path(file.filename or "").name
-    if not name.lower().endswith(".pdf"):
-        raise HTTPException(status_code=400, detail="Only PDF files are supported.")
+    if not name.lower().endswith((".pdf", ".parquet", ".pq")):
+        raise HTTPException(status_code=400, detail="Only PDF and Parquet files are supported.")
     rag = app.state.rag
     target = rag.DOCS_DIR / name
     target.write_bytes(file.file.read())
     try:
-        status, chunks = rag.ingest_pdf(target, name)
+        status, chunks = rag.ingest_document(target, name)
     except Exception as error:
         logger.exception("Failed to index %s", name)
         raise HTTPException(status_code=502, detail=f"Failed to index {name}: {error}") from error

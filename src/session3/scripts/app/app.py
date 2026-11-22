@@ -323,10 +323,10 @@ def settings_dialog():
 # Sidebar
 # --------------------------------------------------------------------------- #
 def ingest_uploads(files):
-    """Send uploaded PDFs to the backend, which saves and indexes them."""
+    """Send uploaded PDF or Parquet documents to the backend."""
     for uploaded in files:
         name = Path(uploaded.name).name
-        logger.info("Uploading PDF %s to the backend", name)
+        logger.info("Uploading document %s to the backend", name)
         try:
             with st.spinner(f"Indexing {name}… (large PDFs can take a few minutes)"):
                 result = api_client.upload_document(name, uploaded.getvalue())
@@ -393,7 +393,7 @@ with st.sidebar:
     # ---- documents ----
     st.markdown('<div class="side-heading">Your Documents</div>', unsafe_allow_html=True)
     uploads = st.file_uploader(
-        "Upload PDFs", type=["pdf"], accept_multiple_files=True,
+        "Upload documents", type=["pdf", "parquet", "pq"], accept_multiple_files=True,
         key=f"uploader_{ss.uploader_key}", label_visibility="collapsed",
     )
     if uploads and st.button("Add to knowledge base", icon=":material/upload_file:",

@@ -107,6 +107,7 @@ from Speculative_RAG import (  # noqa: E402
     DRAFT_MODEL,
     DRAFT_REASONING,
     VERIFY_MODEL,
+    detect_language,
 )
 
 EVAL_PATH = SESSION_DIR / "JSON-Test-cases/cluster_comparison_ground_truth.json"
@@ -133,13 +134,10 @@ def contains(text, truths):
     """Return True if an accepted ground-truth phrase appears in text."""
     if isinstance(truths, str):
         truths = [truths]
-    text_norm = re.sub(r"[^a-z0-9]+", " ", str(text).lower()).strip()
+    text_norm = _norm(text)
     for truth in truths:
-        needle = re.sub(r"[^a-z0-9]+", " ", str(truth).lower()).strip()
-        if needle and re.search(
-            rf"(?<![a-z0-9]){re.escape(needle)}(?![a-z0-9])",
-            text_norm,
-        ):
+        needle = _norm(truth)
+        if needle and needle in text_norm:
             return True
     return False
 
@@ -153,13 +151,10 @@ def matches_item(text, item):
     groups = item.get("required_concepts")
     if not groups:
         return contains(text, item["ground_truth"])
-    normalized = re.sub(r"[^a-z0-9]+", " ", str(text).lower()).strip()
+    normalized = _norm(text)
     for alternatives in groups:
         if not any(
-            re.search(
-                rf"(?<![a-z0-9]){re.escape(re.sub(r'[^a-z0-9]+', ' ', phrase.lower()).strip())}(?![a-z0-9])",
-                normalized,
-            )
+            _norm(phrase) in normalized
             for phrase in alternatives
         ):
             return False
@@ -185,14 +180,15 @@ def run_drafts_and_verification(question, subsets, token_tracker=None, method=No
         stage(progress, method, f"STAGE 1/2 drafting: {len(subsets)} drafts in parallel ...")
     with ThreadPoolExecutor(max_workers=len(subsets)) as pool:
         futures = [
-            pool.submit(draft, question, subset, i + 1, token_tracker)
+            pool.submit(draft, question, subset, i + 1, token_tracker, detect_language(question))
             for i, subset in enumerate(subsets)
         ]
         drafts = [f.result() for f in futures]
     if method:
         stage(progress, method, f"STAGE 2/2 verifying: scoring {len(drafts)} drafts ...")
     scores, best, tie_reason, final_answer = verify(
-        question, drafts, subsets, token_tracker=token_tracker
+        question, drafts, subsets, token_tracker=token_tracker,
+        language=detect_language(question),
     )
     return {
         "answer": final_answer,
@@ -228,14 +224,12 @@ def concept_groups(item):
 
 
 def _norm(text):
-    return re.sub(r"[^a-z0-9]+", " ", str(text).lower()).strip()
+    return re.sub(r"[^\w\u0600-\u06ff]+", " ", str(text).casefold(), flags=re.UNICODE).strip()
 
 
 def _has_phrase(norm_text, phrase):
     needle = _norm(phrase)
-    return bool(needle) and re.search(
-        rf"(?<![a-z0-9]){re.escape(needle)}(?![a-z0-9])", norm_text
-    ) is not None
+    return bool(needle) and needle in norm_text
 
 
 def groups_found(text, groups):
@@ -561,6 +555,7 @@ def begin_trace_file(path, title):
 
 def score_one_question(item, k, subsets_only, progress=""):
     question = item["question"]
+    language = detect_language(question)
     source = item.get("source") or None
     q_tokens = count_question_tokens(question)
     logger.info("Evaluating %s | question_tokens=%d", item.get("id", "?"), q_tokens)
@@ -575,6 +570,9 @@ def score_one_question(item, k, subsets_only, progress=""):
         "topic": item.get("topic"),
         "ground_truth": item["ground_truth"],
         "source": source,
+        "language": language,
+        "draft_model": DRAFT_MODEL,
+        "verifier_model": VERIFY_MODEL,
     }
     if not docs:
         return {**base, "status": "no_retrieval"}
@@ -670,7 +668,13 @@ def score_one_question(item, k, subsets_only, progress=""):
     stage(progress, "PLAIN RAG", "STAGE 1/1 drafting from all retrieved chunks ...")
     started = time.perf_counter()
     try:
-        baseline_answer = draft(question, docs, draft_idx="baseline", token_tracker=token_tracker)["answer"]
+        baseline_answer = draft(
+            question,
+            docs,
+            draft_idx="baseline",
+            token_tracker=token_tracker,
+            language=detect_language(question),
+        )["answer"]
         baseline_error = None
     except Exception as error:
         if any(t in str(error).lower() for t in VERIFIER_DOWN_MARKERS):
@@ -895,6 +899,19 @@ def build_report(results, k, subsets_only):
         ["System", "Final acc.", "Oracle", "Subset hit", "Concept recall",
          "Best-subset cov.", "Distinct chunks", "Subset overlap", "Avg sec"], rows,
     ), "", f"Retrieval MRR: **{mrr:.3f}**"]
+    language_rows = []
+    for language, label in (("en", "English"), ("ar", "Arabic")):
+        group = [r for r in ok if r.get("language") == language]
+        if group:
+            language_rows.append([
+                f"{label} ({len(group)})",
+                pct(summary_row(group)["accuracy"]),
+                pct(mean(r["baseline"]["correct"] for r in group)),
+                pct(summary_row(group)["concept_recall"]),
+            ])
+    if language_rows:
+        out += ["", "## 2. Accuracy by language", "",
+                md_table(["Language", "Speculative RAG", "Plain RAG", "Concept recall"], language_rows)]
     out += retrieval_section(ok, 2)
 
     usage_rows = [r.get("llm_usage", {}) for r in ok if r.get("llm_usage")]

@@ -14,6 +14,7 @@ import numpy as np
 import requests
 import chromadb
 import pymupdf
+import pandas as pd
 from dotenv import load_dotenv
 from sklearn.cluster import KMeans
 
@@ -49,6 +50,11 @@ load_dotenv()
 
 OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY")
 EMBED_MODEL = os.getenv("OPENROUTER_MODEL")
+ARABIC_EMBED_MODEL = (
+    os.getenv("ARABIC_EMBED_MODEL")
+    or os.getenv("OPENROUTER_ARABIC_MODEL")
+    or EMBED_MODEL
+).strip()
 DRAFT_MODEL = os.getenv("DRAFT_MODEL", "qwen/qwen3.5-9b").strip()
 # Reasoning control for the DRAFT model only (no token limit is applied).
 #   DRAFT_REASONING unset / "default" -> send nothing, the model decides (previous behaviour)
@@ -83,7 +89,7 @@ if missing:
     raise RuntimeError(f"Missing values in .env: {', '.join(missing)}")
 
 OPENROUTER_CHAT_URL = "https://openrouter.ai/api/v1/chat/completions"
-VERIFY_TIMEOUT = 90  # seconds per verification request
+VERIFY_TIMEOUT = 4000  # seconds per verification request
 
 # Final configuration.
 CHUNK_SIZE = 1000
@@ -103,8 +109,8 @@ CHROMA_PATH = str(SESSION_DIR / "chroma_db")
 DOCS_DIR = SESSION_DIR / "pdfs"
 DOCS_DIR.mkdir(exist_ok=True)
 
-if not any(DOCS_DIR.glob("*.pdf")):
-    logger.warning("No PDFs found in %s yet. Upload one from the UI or drop it in the folder", DOCS_DIR)
+if not any(path.suffix.lower() in (".pdf", ".parquet", ".pq") for path in DOCS_DIR.iterdir()):
+    logger.warning("No PDF or Parquet documents found in %s yet.", DOCS_DIR)
 
 logger.info("OpenRouter verifier model: %r | drafting model: %r", VERIFY_MODEL, DRAFT_MODEL)
 
@@ -159,6 +165,9 @@ DRAFT_INPUT_PRICE_PER_M = _price_from_env("DRAFT_OPENROUTER_INPUT_PRICE_PER_M", 
 DRAFT_OUTPUT_PRICE_PER_M = _price_from_env("DRAFT_OPENROUTER_OUTPUT_PRICE_PER_M", "0.13")
 # openai/text-embedding-3-small standard (non-batch) input price, USD per 1M tokens.
 EMBEDDING_INPUT_PRICE_PER_M = _price_from_env("EMBEDDING_INPUT_PRICE_PER_M", "0.02")
+ARABIC_EMBEDDING_INPUT_PRICE_PER_M = _price_from_env(
+    "ARABIC_EMBEDDING_INPUT_PRICE_PER_M", "0.02"
+)
 
 
 def calculate_cost(input_tokens, output_tokens,
@@ -188,11 +197,27 @@ def _record_provider_cost(usage, input_tokens, output_tokens, input_price_per_m,
 # --------------------------------------------------------------------------- #
 # Indexing
 # --------------------------------------------------------------------------- #
-def get_chroma_collection():
+ARABIC_RE = re.compile(r"[\u0600-\u06ff]")
+
+
+def detect_language(text):
+    """Route a document or question to the Arabic or English index."""
+    text = str(text or "")
+    letters = [char for char in text if char.isalpha()]
+    arabic_letters = sum(bool(ARABIC_RE.match(char)) for char in letters)
+    if letters and arabic_letters / len(letters) >= 0.20:
+        return "ar"
+    if arabic_letters:
+        return "ar"
+    return "en"
+
+
+def get_chroma_collection(language="en"):
     """Return the persistent ChromaDB collection (created if missing)."""
     client = chromadb.PersistentClient(path=CHROMA_PATH)
+    name = "arabic_docs" if language == "ar" else "docs"
     return client.get_or_create_collection(
-        name="docs",
+        name=name,
         metadata={"hnsw:space": "cosine"},
     )
 
@@ -212,12 +237,64 @@ def extract_pdf(pdf_path):
     return "\n".join(lines)
 
 
+def extract_parquet(parquet_path):
+    """Convert text-bearing Parquet columns into indexed document blocks."""
+    frame = pd.read_parquet(parquet_path)
+    blocks = []
+    text_columns = [
+        column for column in frame.columns
+        if pd.api.types.is_string_dtype(frame[column])
+        or pd.api.types.is_object_dtype(frame[column])
+    ]
+    for row_number, (_, row) in enumerate(frame.iterrows(), start=1):
+        parts = []
+        for column in text_columns:
+            value = row[column]
+            if isinstance(value, bytes):
+                continue
+            if not isinstance(value, str):
+                continue
+            value = value.strip()
+            if value:
+                parts.append(f"{column}: {value}" if len(text_columns) > 1 else value)
+        if parts:
+            blocks.append(f"[Row {row_number}] " + "\n".join(parts))
+    return "\n\n".join(blocks)
+
+
+def extract_document(document_path):
+    suffix = Path(document_path).suffix.lower()
+    if suffix == ".pdf":
+        return extract_pdf(document_path)
+    if suffix in (".parquet", ".pq"):
+        return extract_parquet(document_path)
+    raise ValueError(f"Unsupported document format: {suffix}")
+
+
 def split_text_to_chunks(text):
     """Split text into whole-sentence chunks with overlap."""
-    sentences = re.split(r"(?<=[.!?])\s+(?=[A-Z])", text)
+    sentences = [
+        sentence.strip()
+        for sentence in re.split(r"(?<=[.!?؟!\n])(?:\s+|\n+)", str(text))
+        if sentence.strip()
+    ]
     chunks, current, length = [], [], 0
 
     for sentence in sentences:
+        if len(sentence) > CHUNK_SIZE:
+            if current:
+                chunks.append(" ".join(current))
+                current, length = [], 0
+            start = 0
+            while start < len(sentence):
+                end = min(start + CHUNK_SIZE, len(sentence))
+                if end < len(sentence):
+                    boundary = max(sentence.rfind(" ", start, end), sentence.rfind("\n", start, end))
+                    if boundary > start:
+                        end = boundary
+                chunks.append(sentence[start:end].strip())
+                start = end - OVERLAP if end - OVERLAP > start else end
+            continue
         if length + len(sentence) > CHUNK_SIZE and current:
             chunks.append(" ".join(current))
             while current and length > OVERLAP:
@@ -231,7 +308,7 @@ def split_text_to_chunks(text):
     return chunks
 
 
-def get_embeddings(texts, purpose="embedding", token_tracker=None):
+def get_embeddings(texts, purpose="embedding", token_tracker=None, language=None):
     """Embed texts through OpenRouter and log token usage plus USD cost.
 
     Embeddings are input-only: cost is based on the number of input tokens sent
@@ -245,16 +322,31 @@ def get_embeddings(texts, purpose="embedding", token_tracker=None):
     provider_cost_calls = 0
     estimated_cost_calls = 0
 
-    logger.debug("Embedding %d texts through OpenRouter (%s)", len(texts), purpose)
+    language = language or ("ar" if any(detect_language(text) == "ar" for text in texts) else "en")
+    embed_model = ARABIC_EMBED_MODEL if language == "ar" else EMBED_MODEL
+    embedding_price = ARABIC_EMBEDDING_INPUT_PRICE_PER_M if language == "ar" else EMBEDDING_INPUT_PRICE_PER_M
+    logger.debug("Embedding %d texts through OpenRouter (%s, language=%s)", len(texts), purpose, language)
     for batch_number, start in enumerate(range(0, len(texts), EMBED_BATCH_SIZE), start=1):
         batch = texts[start:start + EMBED_BATCH_SIZE]
-        response = requests.post(
-            "https://openrouter.ai/api/v1/embeddings",
-            headers={"Authorization": f"Bearer {OPENROUTER_API_KEY}"},
-            json={"model": EMBED_MODEL, "input": batch},
-            timeout=60,
-        )
-        response.raise_for_status()
+        for attempt in range(3):
+            try:
+                response = requests.post(
+                    "https://openrouter.ai/api/v1/embeddings",
+                    headers={"Authorization": f"Bearer {OPENROUTER_API_KEY}"},
+                    json={"model": embed_model, "input": batch},
+                    timeout=120,
+                )
+                response.raise_for_status()
+                break
+            except (requests.RequestException, requests.HTTPError) as error:
+                if attempt == 2:
+                    raise
+                logger.warning(
+                    "Embedding request failed (attempt %d/3): %s. Retrying...",
+                    attempt + 1,
+                    error,
+                )
+                time.sleep(2 ** attempt)
         body = response.json()
         data = sorted(body["data"], key=lambda item: item["index"])
         vectors.extend(item["embedding"] for item in data)
@@ -276,7 +368,7 @@ def get_embeddings(texts, purpose="embedding", token_tracker=None):
             cost_source = "provider-reported"
             provider_cost_calls += 1
         else:
-            batch_cost = (input_tokens / 1_000_000) * EMBEDDING_INPUT_PRICE_PER_M
+            batch_cost = (input_tokens / 1_000_000) * embedding_price
             cost_source = "rate-estimate"
             estimated_cost_calls += 1
 
@@ -299,8 +391,8 @@ def get_embeddings(texts, purpose="embedding", token_tracker=None):
         logger.info(
             "[EMBEDDING COST] model=%s | purpose=%s | batch=%d | texts=%d | "
             "input_tokens=%d (%s) | cost=$%.10f (%s) | rate=$%.4f/1M tokens",
-            EMBED_MODEL, purpose, batch_number, len(batch), input_tokens,
-            token_source, batch_cost, cost_source, EMBEDDING_INPUT_PRICE_PER_M,
+            embed_model, purpose, batch_number, len(batch), input_tokens,
+            token_source, batch_cost, cost_source, embedding_price,
         )
 
     if texts:
@@ -308,7 +400,7 @@ def get_embeddings(texts, purpose="embedding", token_tracker=None):
             "[EMBEDDING SUMMARY] model=%s | purpose=%s | texts=%d | "
             "input_tokens=%d | total_cost=$%.10f USD | provider_cost_batches=%d | "
             "estimated_cost_batches=%d",
-            EMBED_MODEL, purpose, len(texts), total_tokens, total_cost,
+            embed_model, purpose, len(texts), total_tokens, total_cost,
             provider_cost_calls, estimated_cost_calls,
         )
     return vectors
@@ -324,25 +416,35 @@ def file_sha256(path):
 
 
 def ingest_pdf(pdf_path, name=None, progress_callback=None):
-    """Chunk, embed and store one PDF in ChromaDB.
+    """Backward-compatible PDF ingestion wrapper."""
+    return ingest_document(pdf_path, name=name, progress_callback=progress_callback)
+
+
+def ingest_document(document_path, name=None, progress_callback=None):
+    """Chunk, embed and store one PDF or Parquet document in ChromaDB.
 
     Returns (status, chunk_count) where status is "added", "unchanged" or "empty".
     - Identical file already indexed  -> skipped ("unchanged").
     - Same file name but new content  -> old chunks are replaced.
     progress_callback(done, total) is called after each embedded batch.
     """
-    pdf_path = str(pdf_path)
-    name = name or os.path.basename(pdf_path)
-    file_hash = file_sha256(pdf_path)
-    collection = get_chroma_collection()
-
-    if collection.get(where={"file_hash": file_hash}, limit=1)["ids"]:
+    document_path = str(document_path)
+    name = name or os.path.basename(document_path)
+    suffix = Path(document_path).suffix.lower()
+    if suffix not in (".pdf", ".parquet", ".pq"):
+        raise ValueError(f"Unsupported document format: {suffix}")
+    file_hash = file_sha256(document_path)
+    if (
+        get_chroma_collection("en").get(where={"file_hash": file_hash}, limit=1)["ids"]
+        or get_chroma_collection("ar").get(where={"file_hash": file_hash}, limit=1)["ids"]
+    ):
         logger.debug("%s is unchanged, skipping", name)
         return "unchanged", 0
 
-    collection.delete(where={"source": name})
+    get_chroma_collection("en").delete(where={"source": name})
+    get_chroma_collection("ar").delete(where={"source": name})
 
-    chunks = split_text_to_chunks(extract_pdf(pdf_path))
+    chunks = split_text_to_chunks(extract_document(document_path))
     if not chunks:
         logger.warning("No text could be extracted from %s", name)
         return "empty", 0
@@ -351,25 +453,47 @@ def ingest_pdf(pdf_path, name=None, progress_callback=None):
     logger.info("[STAGE: INDEXING] Embedding and indexing %s (%d chunks)...", name, total)
     document_embedding_cost = 0.0
     document_embedding_tokens = 0
-    for start in range(0, total, EMBED_BATCH_SIZE):
-        batch = chunks[start:start + EMBED_BATCH_SIZE]
-        batch_usage = {}
-        batch_vectors = get_embeddings(batch, purpose=f"indexing:{name}", token_tracker=batch_usage)
-        document_embedding_cost += batch_usage.get("embedding_cost", 0.0)
-        document_embedding_tokens += batch_usage.get("embedding_input_tokens", 0)
-        collection.add(
-            documents=batch,
-            embeddings=batch_vectors,
-            metadatas=[{
-                "source": name,
-                "file_hash": file_hash,
-                "embed_model": EMBED_MODEL,
-            }] * len(batch),
-            ids=[f"{file_hash[:16]}_{start + j}" for j in range(len(batch))],
-        )
-        logger.debug("Stored %d/%d chunks of %s", min(start + len(batch), total), total, name)
+    for language in ("en", "ar"):
+        language_chunks = [
+            (position, chunk)
+            for position, chunk in enumerate(chunks)
+            if detect_language(chunk) == language
+        ]
+        if not language_chunks:
+            continue
+        collection = get_chroma_collection(language)
+        embed_model = ARABIC_EMBED_MODEL if language == "ar" else EMBED_MODEL
+        for start in range(0, len(language_chunks), EMBED_BATCH_SIZE):
+            batch_items = language_chunks[start:start + EMBED_BATCH_SIZE]
+            batch = [chunk for _, chunk in batch_items]
+            batch_usage = {}
+            batch_vectors = get_embeddings(
+                batch,
+                purpose=f"indexing:{name}",
+                token_tracker=batch_usage,
+                language=language,
+            )
+            document_embedding_cost += batch_usage.get("embedding_cost", 0.0)
+            document_embedding_tokens += batch_usage.get("embedding_input_tokens", 0)
+            collection.add(
+                documents=batch,
+                embeddings=batch_vectors,
+                metadatas=[{
+                    "source": name,
+                    "file_hash": file_hash,
+                    "embed_model": embed_model,
+                    "language": language,
+                }] * len(batch),
+                ids=[
+                    f"{file_hash[:16]}_{language}_{position}"
+                    for position, _ in batch_items
+                ],
+            )
+        logger.debug("Stored language=%s chunks of %s", language, name)
+    for done in range(0, total, EMBED_BATCH_SIZE):
+        done_count = min(done + EMBED_BATCH_SIZE, total)
         if progress_callback:
-            progress_callback(min(start + len(batch), total), total)
+            progress_callback(done_count, total)
     logger.info(
         "[DOCUMENT EMBEDDING COST] file=%s | model=%s | chunks=%d | input_tokens=%d | "
         "total_cost=$%.10f USD",
@@ -385,15 +509,29 @@ def build_index():
     Unchanged PDFs are skipped quickly. If the embedding model changed since the
     index was built, the whole collection is rebuilt.
     """
-    collection = get_chroma_collection()
+    collection = get_chroma_collection("en")
     if collection.count() > 0:
         sample = collection.get(limit=1, include=["metadatas"])["metadatas"][0]
-        if sample.get("embed_model") != EMBED_MODEL:
+        if sample.get("embed_model") != EMBED_MODEL or "language" not in sample:
             logger.warning("Embedding model changed (or old index format). Rebuilding the index.")
             chromadb.PersistentClient(path=CHROMA_PATH).delete_collection(name="docs")
+            try:
+                chromadb.PersistentClient(path=CHROMA_PATH).delete_collection(name="arabic_docs")
+            except Exception:
+                pass
+    arabic_collection = get_chroma_collection("ar")
+    if arabic_collection.count() > 0:
+        sample = arabic_collection.get(limit=1, include=["metadatas"])["metadatas"][0]
+        if sample.get("embed_model") != ARABIC_EMBED_MODEL:
+            logger.warning("Arabic embedding model changed. Rebuilding the Arabic index.")
+            chromadb.PersistentClient(path=CHROMA_PATH).delete_collection(name="arabic_docs")
 
-    for pdf_path in sorted(DOCS_DIR.glob("*.pdf")):
-        status, _ = ingest_pdf(pdf_path)
+    document_paths = sorted(
+        path for path in DOCS_DIR.iterdir()
+        if path.suffix.lower() in (".pdf", ".parquet", ".pq")
+    )
+    for pdf_path in document_paths:
+        status, _ = ingest_document(pdf_path)
         if status == "unchanged":
             logger.debug("%s: already indexed", pdf_path.name)
         elif status == "empty":
@@ -403,17 +541,21 @@ def build_index():
 
 def list_documents():
     """Return {file name: chunk count} for everything currently indexed."""
-    collection = get_chroma_collection()
-    if collection.count() == 0:
+    metas = []
+    for language in ("en", "ar"):
+        collection = get_chroma_collection(language)
+        if collection.count():
+            metas.extend(collection.get(include=["metadatas"])["metadatas"])
+    if not metas:
         return {}
-    metas = collection.get(include=["metadatas"])["metadatas"]
     return dict(Counter(m["source"] for m in metas))
 
 
 def delete_document(name):
     """Remove a document from the index (and from DOCS_DIR if it is there)."""
     logger.info("Deleting document %s from the index", name)
-    get_chroma_collection().delete(where={"source": name})
+    get_chroma_collection("en").delete(where={"source": name})
+    get_chroma_collection("ar").delete(where={"source": name})
     path = DOCS_DIR / Path(name).name
     if path.exists():
         path.unlink()
@@ -433,7 +575,12 @@ def retrieve(question, k=DEFAULT_RETRIEVAL_K, return_distances=False, source=Non
     If `source` is given (an indexed PDF file name), only chunks from that
     document are searched, so other PDFs cannot distract the model.
     """
-    collection = get_chroma_collection()
+    language = detect_language(question)
+    collection = get_chroma_collection(language)
+    logger.info("[LANGUAGE ROUTING] question_language=%s | embedding_model=%s | collection=%s",
+                language,
+                ARABIC_EMBED_MODEL if language == "ar" else EMBED_MODEL,
+                "arabic_docs" if language == "ar" else "docs")
     where = {"source": source} if source else None
     if where:
         count = len(collection.get(where=where, include=[])["ids"])
@@ -453,7 +600,12 @@ def retrieve(question, k=DEFAULT_RETRIEVAL_K, return_distances=False, source=Non
         "Retrieving the top %d of %d chunks (scope: %s)",
         min(k, count), count, source or "all documents",
     )
-    q_emb = get_embeddings([question], purpose="question-retrieval", token_tracker=token_tracker)[0]
+    q_emb = get_embeddings(
+        [question],
+        purpose="question-retrieval",
+        token_tracker=token_tracker,
+        language=language,
+    )[0]
     query_args = dict(
         query_embeddings=[q_emb],
         n_results=min(k, count),
@@ -791,14 +943,18 @@ def _call_openrouter_text(prompt, model, stage_label, token_tracker=None, json_m
     return content
 
 
-def draft(question, subset, draft_idx=None, token_tracker=None):
+def draft(question, subset, draft_idx=None, token_tracker=None, language=None):
     """Generate one draft answer + rationale using the configured OpenRouter drafting model."""
     docs_text = "\n\n".join(f"[{i}] {d}" for i, d in enumerate(subset, start=1))
     prompt = DRAFT_PROMPT.format(docs=docs_text, question=question)
+    language = language or detect_language(question)
+    model = DRAFT_MODEL
+    if language == "ar":
+        prompt += "\n\nLanguage requirement: Answer in clear Modern Standard Arabic. Preserve Arabic names and terms exactly when supported by the documents."
     label = f"Draft {draft_idx}" if draft_idx is not None else "Draft"
-    logger.debug("Calling OpenRouter drafting model %s for %s with %d chunks", DRAFT_MODEL, label, len(subset))
+    logger.debug("Calling OpenRouter drafting model %s for %s with %d chunks (language=%s)", model, label, len(subset), language)
     raw = _call_openrouter_text(
-        prompt, DRAFT_MODEL, label, token_tracker=token_tracker, json_mode=True,
+        prompt, model, label, token_tracker=token_tracker, json_mode=True,
         reasoning=DRAFT_REASONING_PARAM,
     )
     try:
@@ -938,9 +1094,12 @@ def _extract_json(text):
         return json.loads(match.group(0))
 
 
-def call_verifier(prompt, stage_label="verify", token_tracker=None):
+def call_verifier(prompt, stage_label="verify", token_tracker=None, language=None):
     """Send one prompt to the OpenRouter model and return the parsed JSON reply."""
     started = time.perf_counter()
+    model = VERIFY_MODEL
+    if language == "ar":
+        prompt += "\n\nLanguage requirement: The question and expected answer language are Arabic. Evaluate Arabic and English evidence faithfully and return JSON keys as specified."
     try:
         response = requests.post(
             OPENROUTER_CHAT_URL,
@@ -949,7 +1108,7 @@ def call_verifier(prompt, stage_label="verify", token_tracker=None):
                 "Content-Type": "application/json",
             },
             json={
-                "model": VERIFY_MODEL,
+                "model": model,
                 "messages": [{"role": "user", "content": prompt}],
                 "temperature": 0,
                 "response_format": {"type": "json_object"},
@@ -984,7 +1143,7 @@ def call_verifier(prompt, stage_label="verify", token_tracker=None):
     out_tok = count_output_tokens(content or "", usage.get("completion_tokens"))
     logger.info(
         "[TOKENS | OpenRouter %s] (%s) finished in %.2fs | input_tokens=%d | output_tokens=%d",
-        VERIFY_MODEL, stage_label, elapsed, in_tok, out_tok,
+        model, stage_label, elapsed, in_tok, out_tok,
     )
     if token_tracker is not None:
         token_tracker["verifier_openrouter_input"] += in_tok
@@ -1000,7 +1159,7 @@ def call_verifier(prompt, stage_label="verify", token_tracker=None):
             cost_source == "rate-estimate"
         )
         logger.info("[COST | OpenRouter %s] %s cost=$%.10f (%s)",
-                    VERIFY_MODEL, stage_label, call_cost, cost_source)
+                    model, stage_label, call_cost, cost_source)
 
     return _extract_json(content)
 
@@ -1054,7 +1213,7 @@ def _build_verification_inputs(drafts, subsets):
     return source_documents, candidates
 
 
-def resolve_tie(question, source_documents, candidates, tied_indexes, retries=3, token_tracker=None):
+def resolve_tie(question, source_documents, candidates, tied_indexes, retries=3, token_tracker=None, language=None):
     """Ask the verifier to choose exactly one of the drafts tied for the highest score."""
     tied_candidates = [
         candidate for candidate in candidates
@@ -1069,7 +1228,12 @@ def resolve_tie(question, source_documents, candidates, tied_indexes, retries=3,
     for attempt in range(retries):
         wait_for_slot()
         try:
-            data = call_verifier(prompt, stage_label="tie-break", token_tracker=token_tracker)
+            data = call_verifier(
+                prompt,
+                stage_label="tie-break",
+                token_tracker=token_tracker,
+                language=language,
+            )
             winner = data.get("winner_index")
             reason = str(data.get("reason", "")).strip()
             if isinstance(winner, bool) or not isinstance(winner, int):
@@ -1093,7 +1257,7 @@ def resolve_tie(question, source_documents, candidates, tied_indexes, retries=3,
     ) from last_error
 
 
-def verify(question, drafts, subsets, retries=5, token_tracker=None):
+def verify(question, drafts, subsets, retries=5, token_tracker=None, language=None):
     """Score drafts, then use a second verifier call only if the top score is tied."""
     if not drafts:
         raise ValueError("Cannot verify an empty list of drafts")
@@ -1114,7 +1278,12 @@ def verify(question, drafts, subsets, retries=5, token_tracker=None):
                 prompt + f"\n\nYour previous reply was invalid. Return exactly {n} "
                          f"numeric scores between 0 and 10 in a JSON list."
             )
-            data = call_verifier(attempt_prompt, stage_label="scoring", token_tracker=token_tracker)
+            data = call_verifier(
+                attempt_prompt,
+                stage_label="scoring",
+                token_tracker=token_tracker,
+                language=language,
+            )
             raw_scores = data["scores"]
             if isinstance(raw_scores, dict):
                 raw_scores = [raw_scores[key] for key in sorted(raw_scores, key=lambda x: int(x))]
@@ -1134,7 +1303,8 @@ def verify(question, drafts, subsets, retries=5, token_tracker=None):
                     [i + 1 for i in tied],
                 )
                 best, tie_reason = resolve_tie(
-                    question, source_documents, candidates, tied, token_tracker=token_tracker
+                    question, source_documents, candidates, tied,
+                    token_tracker=token_tracker, language=language
                 )
             logger.debug(
                 "Verifier scores: %s, best draft: %d; tie decision: %s",
@@ -1196,10 +1366,12 @@ def rewrite_question(question, history, token_tracker=None):
         text = " ".join(str(m["content"]).split())[:HISTORY_CHARS]
         lines.append(f"{speaker}: {text}")
     prompt = REWRITE_PROMPT.format(history="\n".join(lines), question=question)
-    logger.info("[STAGE: REWRITING] Resolving follow-up question context with OpenRouter (%s)...", DRAFT_MODEL)
+    language = detect_language(question)
+    model = DRAFT_MODEL
+    logger.info("[STAGE: REWRITING] Resolving follow-up question context with OpenRouter (%s, language=%s)...", model, language)
     try:
         rewritten = _call_openrouter_text(
-            prompt, DRAFT_MODEL, "question rewrite", token_tracker=token_tracker,
+            prompt, model, "question rewrite", token_tracker=token_tracker,
         )
         rewritten = " ".join(rewritten.split()).strip().strip('"')
     except Exception:
@@ -1319,6 +1491,8 @@ def answer_question(
         raise ValueError("Only the 'subsets' strategy is supported.")
 
     pipeline_start = time.perf_counter()
+    language = detect_language(question)
+    logger.info("[LANGUAGE ROUTING] Selected language pipeline: %s", "Arabic" if language == "ar" else "English")
     raw_q_tokens = count_question_tokens(question)
     logger.info(
         "[STAGE 0/4: START] Received question | question_tokens=%d | scope=%s | question=%r",
@@ -1405,7 +1579,7 @@ def answer_question(
     )
     with ThreadPoolExecutor(max_workers=len(evidence_groups)) as pool:
         futures = [
-            pool.submit(draft, question, group, index + 1, token_tracker)
+            pool.submit(draft, question, group, index + 1, token_tracker, language)
             for index, group in enumerate(evidence_groups)
         ]
         drafts = [future.result() for future in futures]
@@ -1415,7 +1589,7 @@ def answer_question(
         len(drafts),
     )
     scores, best, tie_reason, final_answer = verify(
-        question, drafts, evidence_groups, token_tracker=token_tracker
+        question, drafts, evidence_groups, token_tracker=token_tracker, language=language
     )
 
     trace_generation(drafts, scores, best, positions, final_answer, group_name=group_name)

@@ -23,6 +23,11 @@ SOURCE_DIRECT = "direct"
 
 
 _SMALL_TALK_REPLIES = {
+    "مرحبا": "مرحبًا! كيف يمكنني مساعدتك؟",
+    "اهلا": "أهلًا! كيف يمكنني مساعدتك؟",
+    "السلام عليكم": "وعليكم السلام! كيف يمكنني مساعدتك؟",
+    "شكرا": "على الرحب والسعة!",
+    "شكراً": "على الرحب والسعة!",
     "hello": "Hello! How can I help you?",
     "hi": "Hello! How can I help you?",
     "hey": "Hey! How can I help you?",
