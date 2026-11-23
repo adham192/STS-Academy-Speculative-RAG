@@ -45,3 +45,8 @@ def upload_document(name, data):
 
 def delete_document(name):
     return _request("DELETE", f"/documents/{requests.utils.quote(name, safe='')}", QUICK_TIMEOUT)
+
+
+def index_status():
+    """{'state': 'indexing'|'ready'|'error'|'idle', 'document', 'done', 'total', 'error'}"""
+    return _request("GET", "/index/status", QUICK_TIMEOUT)

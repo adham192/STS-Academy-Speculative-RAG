@@ -5,6 +5,7 @@ Run:  uvicorn api:app --app-dir scripts/backend --host 0.0.0.0 --port 8000
 
 import logging
 import sys
+import threading
 from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Literal, Optional
@@ -40,13 +41,21 @@ async def lifespan(app: FastAPI):
     import Speculative_RAG as rag
 
     database.init_db()                  # logs and carries on if PostgreSQL is not up yet
-    try:
-        rag.build_index()               # fast no-op when nothing changed
-    except Exception:
-        logger.exception("build_index() failed; the API still starts")
     app.state.rag = rag
     app.state.qa = QAService(rag)
-    logger.info("Backend ready")
+
+    def index_in_background():
+        # Indexing a large corpus can take a long time; running it here (not in the startup
+        # hook) lets the API answer /health right away. It resumes after interruptions.
+        try:
+            rag.build_index()           # fast no-op when nothing changed
+        except Exception as error:
+            rag._set_index_status(state="error", error=str(error))
+            logger.exception("build_index() failed; the API keeps running")
+
+    rag._set_index_status(state="indexing")
+    threading.Thread(target=index_in_background, name="index-builder", daemon=True).start()
+    logger.info("Backend ready (indexing continues in the background)")
     yield
 
 
@@ -81,13 +90,27 @@ class AskResponse(BaseModel):
 @app.get("/health")
 def health():
     """Liveness plus dependency status. Redis/PostgreSQL being down does not fail the probe."""
-    return {"status": "ok", "postgres": database.ping(), "redis": cache.ping()}
+    index = app.state.rag.get_index_status() if getattr(app.state, "rag", None) else None
+    return {"status": "ok", "postgres": database.ping(), "redis": cache.ping(), "index": index}
+
+
+@app.get("/index/status")
+def index_status():
+    """Progress of the background indexing: state, current document, done/total chunks."""
+    return app.state.rag.get_index_status()
 
 
 @app.post("/ask", response_model=AskResponse)
 def ask(request: AskRequest):
     if not request.question.strip():
         raise HTTPException(status_code=422, detail="Question must not be empty.")
+    status = app.state.rag.get_index_status()
+    if status["state"] == "indexing":
+        raise HTTPException(
+            status_code=503,
+            detail=(f"The documents are still being indexed ({status['document'] or '...'}: "
+                    f"{status['done']}/{status['total']} chunks). Please try again shortly."),
+        )
     history = [m.model_dump() for m in request.history] if request.history else None
     try:
         result = app.state.qa.ask(

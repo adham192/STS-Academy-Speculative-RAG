@@ -105,7 +105,8 @@ SHORT_TASK_ATTEMPTS = int(os.getenv("SHORT_TASK_ATTEMPTS", "2"))
 # Final configuration.
 CHUNK_SIZE = 1000
 OVERLAP = 250
-EMBED_BATCH_SIZE = 20
+EMBED_BATCH_SIZE = int(os.getenv("EMBED_BATCH_SIZE", "64"))   # texts per embedding request
+EMBED_WORKERS = int(os.getenv("EMBED_WORKERS", "4"))          # embedding requests sent in parallel
 DEFAULT_RETRIEVAL_K = 20
 DEFAULT_N_CLUSTERS = 2
 DEFAULT_N_SUBSETS = 5
@@ -119,6 +120,21 @@ BASE_DIR = Path(__file__).resolve().parent
 CHROMA_PATH = str(SESSION_DIR / "chroma_db")
 DOCS_DIR = SESSION_DIR / "pdfs"
 DOCS_DIR.mkdir(exist_ok=True)
+
+# Live progress of build_index(), read by the API (/health and /index/status).
+INDEX_STATUS = {"state": "idle", "document": None, "done": 0, "total": 0, "error": None}
+_index_status_lock = threading.Lock()
+
+
+def _set_index_status(**changes):
+    with _index_status_lock:
+        INDEX_STATUS.update(changes)
+
+
+def get_index_status():
+    """Return a snapshot of the indexing progress."""
+    with _index_status_lock:
+        return dict(INDEX_STATUS)
 
 if not any(path.suffix.lower() in (".pdf", ".parquet", ".pq") for path in DOCS_DIR.iterdir()):
     logger.warning("No PDF or Parquet documents found in %s yet.", DOCS_DIR)
@@ -484,30 +500,43 @@ def ingest_document(document_path, name=None, progress_callback=None):
     document_embedding_tokens = 0
     stored = len(existing_ids)
     try:
-        for start in range(0, len(pending), EMBED_BATCH_SIZE):
-            positions = pending[start:start + EMBED_BATCH_SIZE]
-            batch = [chunks[position] for position in positions]
-            batch_usage = {}
-            batch_vectors = get_embeddings(
-                batch, purpose=f"indexing:{name}", token_tracker=batch_usage,
+        batches = [
+            pending[start:start + EMBED_BATCH_SIZE]
+            for start in range(0, len(pending), EMBED_BATCH_SIZE)
+        ]
+
+        def embed_batch(positions):
+            usage = {}
+            vectors = get_embeddings(
+                [chunks[position] for position in positions],
+                purpose=f"indexing:{name}", token_tracker=usage,
             )
-            document_embedding_cost += batch_usage.get("embedding_cost", 0.0)
-            document_embedding_tokens += batch_usage.get("embedding_input_tokens", 0)
-            collection.add(
-                documents=batch,
-                embeddings=batch_vectors,
-                metadatas=[{
-                    "source": name,
-                    "file_hash": file_hash,
-                    "embed_model": EMBED_MODEL,
-                    "total_chunks": total,
-                }] * len(batch),
-                ids=[ids_all[position] for position in positions],
-            )
-            stored += len(batch)
-            logger.info("[STAGE: INDEXING] %s: stored %d/%d chunks", name, stored, total)
-            if progress_callback:
-                progress_callback(stored, total)
+            return positions, vectors, usage
+
+        # EMBED_WORKERS requests run in parallel; results are stored in order from this
+        # thread only, so an interruption always leaves a clean, resumable prefix.
+        with ThreadPoolExecutor(max_workers=max(1, EMBED_WORKERS)) as pool:
+            for group_start in range(0, len(batches), max(1, EMBED_WORKERS)):
+                group = batches[group_start:group_start + max(1, EMBED_WORKERS)]
+                for positions, batch_vectors, batch_usage in pool.map(embed_batch, group):
+                    batch = [chunks[position] for position in positions]
+                    document_embedding_cost += batch_usage.get("embedding_cost", 0.0)
+                    document_embedding_tokens += batch_usage.get("embedding_input_tokens", 0)
+                    collection.add(
+                        documents=batch,
+                        embeddings=batch_vectors,
+                        metadatas=[{
+                            "source": name,
+                            "file_hash": file_hash,
+                            "embed_model": EMBED_MODEL,
+                            "total_chunks": total,
+                        }] * len(batch),
+                        ids=[ids_all[position] for position in positions],
+                    )
+                    stored += len(batch)
+                    logger.info("[STAGE: INDEXING] %s: stored %d/%d chunks", name, stored, total)
+                    if progress_callback:
+                        progress_callback(stored, total)
     except Exception:
         logger.error(
             "[STAGE: INDEXING] %s INTERRUPTED at %d/%d chunks. Progress is kept; fix the cause "
@@ -552,14 +581,20 @@ def build_index():
         if path.suffix.lower() in (".pdf", ".parquet", ".pq")
     )
     logger.info("[INDEX] Checking %d document(s) in %s", len(document_paths), DOCS_DIR)
+    _set_index_status(state="indexing", document=None, done=0, total=0, error=None)
     for pdf_path in document_paths:
-        status, chunk_count = ingest_document(pdf_path)
+        _set_index_status(document=pdf_path.name, done=0, total=0)
+        status, chunk_count = ingest_document(
+            pdf_path,
+            progress_callback=lambda done, total: _set_index_status(done=done, total=total),
+        )
         if status == "unchanged":
             logger.info("[INDEX] %s: already indexed", pdf_path.name)
         elif status == "empty":
             logger.warning("[INDEX] No text found in %s, skipping", pdf_path.name)
         else:
             logger.info("[INDEX] %s: indexed %d chunks", pdf_path.name, chunk_count)
+    _set_index_status(state="ready", document=None)
     return get_chroma_collection()
 
 
