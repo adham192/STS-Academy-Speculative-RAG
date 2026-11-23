@@ -50,19 +50,18 @@ load_dotenv()
 
 OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY")
 EMBED_MODEL = os.getenv("OPENROUTER_MODEL")
-ARABIC_EMBED_MODEL = (
-    os.getenv("ARABIC_EMBED_MODEL")
-    or os.getenv("OPENROUTER_ARABIC_MODEL")
-    or EMBED_MODEL
-).strip()
+# ONE multilingual embedding model for every document and every question, so an Arabic
+# question and an English passage (or the reverse) land in the same vector space.
+# OPENROUTER_MODEL must therefore be a multilingual embedding model.
 DRAFT_MODEL = os.getenv("DRAFT_MODEL", "qwen/qwen3.5-9b").strip()
 # Reasoning control for the DRAFT model only (no token limit is applied).
-#   DRAFT_REASONING unset / "default" -> send nothing, the model decides (previous behaviour)
+#   DRAFT_REASONING unset             -> "off" (drafts only extract a quote and write one sentence)
+#   DRAFT_REASONING=default           -> send nothing, the model decides (can loop for minutes)
 #   DRAFT_REASONING=off               -> ask OpenRouter to disable reasoning
 #   DRAFT_REASONING=low|medium|high   -> ask for that reasoning effort
 # OpenRouter passes this on only if the model/provider supports it; check the logged
 # output_tokens of the drafts to see whether it had an effect.
-DRAFT_REASONING = os.getenv("DRAFT_REASONING", "default").strip().lower() or "default"
+DRAFT_REASONING = os.getenv("DRAFT_REASONING", "off").strip().lower() or "off"
 _REASONING_PARAMS = {
     "off": {"enabled": False}, "none": {"enabled": False}, "false": {"enabled": False},
     "minimal": {"effort": "minimal"}, "low": {"effort": "low"},
@@ -90,6 +89,18 @@ if missing:
 
 OPENROUTER_CHAT_URL = "https://openrouter.ai/api/v1/chat/completions"
 VERIFY_TIMEOUT = 4000  # seconds per verification request
+# No token limit is applied by default. Time is bounded instead: a draft that runs longer
+# than DRAFT_TIMEOUT is stuck (e.g. a reasoning loop), so it is cut off and retried
+# instead of blocking the whole pipeline.
+DRAFT_TIMEOUT = int(os.getenv("DRAFT_TIMEOUT", "120"))         # seconds per draft request
+DRAFT_MAX_TOKENS = int(os.getenv("DRAFT_MAX_TOKENS", "0"))      # 0 = no token limit (only sent if > 0)
+DRAFT_ATTEMPTS = int(os.getenv("DRAFT_ATTEMPTS", "2"))         # tries per draft before giving up
+DRAFT_FAILED_TEXT = "[This draft could not be generated.]"
+# Short helper calls made with the drafting model (query translation, follow-up rewrite).
+# They never need reasoning, so it is always switched off for them, and they give up quickly
+# (the pipeline then just continues with the original question).
+SHORT_TASK_TIMEOUT = int(os.getenv("SHORT_TASK_TIMEOUT", "45"))  # seconds per request
+SHORT_TASK_ATTEMPTS = int(os.getenv("SHORT_TASK_ATTEMPTS", "2"))
 
 # Final configuration.
 CHUNK_SIZE = 1000
@@ -165,9 +176,6 @@ DRAFT_INPUT_PRICE_PER_M = _price_from_env("DRAFT_OPENROUTER_INPUT_PRICE_PER_M", 
 DRAFT_OUTPUT_PRICE_PER_M = _price_from_env("DRAFT_OPENROUTER_OUTPUT_PRICE_PER_M", "0.13")
 # openai/text-embedding-3-small standard (non-batch) input price, USD per 1M tokens.
 EMBEDDING_INPUT_PRICE_PER_M = _price_from_env("EMBEDDING_INPUT_PRICE_PER_M", "0.02")
-ARABIC_EMBEDDING_INPUT_PRICE_PER_M = _price_from_env(
-    "ARABIC_EMBEDDING_INPUT_PRICE_PER_M", "0.02"
-)
 
 
 def calculate_cost(input_tokens, output_tokens,
@@ -197,27 +205,15 @@ def _record_provider_cost(usage, input_tokens, output_tokens, input_price_per_m,
 # --------------------------------------------------------------------------- #
 # Indexing
 # --------------------------------------------------------------------------- #
-ARABIC_RE = re.compile(r"[\u0600-\u06ff]")
+COLLECTION_NAME = "docs_multilingual"          # single collection for all languages
+LEGACY_COLLECTIONS = ("docs", "arabic_docs")   # old language-split indexes, dropped on startup
 
 
-def detect_language(text):
-    """Route a document or question to the Arabic or English index."""
-    text = str(text or "")
-    letters = [char for char in text if char.isalpha()]
-    arabic_letters = sum(bool(ARABIC_RE.match(char)) for char in letters)
-    if letters and arabic_letters / len(letters) >= 0.20:
-        return "ar"
-    if arabic_letters:
-        return "ar"
-    return "en"
-
-
-def get_chroma_collection(language="en"):
-    """Return the persistent ChromaDB collection (created if missing)."""
+def get_chroma_collection():
+    """Return the single persistent ChromaDB collection (created if missing)."""
     client = chromadb.PersistentClient(path=CHROMA_PATH)
-    name = "arabic_docs" if language == "ar" else "docs"
     return client.get_or_create_collection(
-        name=name,
+        name=COLLECTION_NAME,
         metadata={"hnsw:space": "cosine"},
     )
 
@@ -308,7 +304,7 @@ def split_text_to_chunks(text):
     return chunks
 
 
-def get_embeddings(texts, purpose="embedding", token_tracker=None, language=None):
+def get_embeddings(texts, purpose="embedding", token_tracker=None):
     """Embed texts through OpenRouter and log token usage plus USD cost.
 
     Embeddings are input-only: cost is based on the number of input tokens sent
@@ -322,10 +318,9 @@ def get_embeddings(texts, purpose="embedding", token_tracker=None, language=None
     provider_cost_calls = 0
     estimated_cost_calls = 0
 
-    language = language or ("ar" if any(detect_language(text) == "ar" for text in texts) else "en")
-    embed_model = ARABIC_EMBED_MODEL if language == "ar" else EMBED_MODEL
-    embedding_price = ARABIC_EMBEDDING_INPUT_PRICE_PER_M if language == "ar" else EMBEDDING_INPUT_PRICE_PER_M
-    logger.debug("Embedding %d texts through OpenRouter (%s, language=%s)", len(texts), purpose, language)
+    embed_model = EMBED_MODEL
+    embedding_price = EMBEDDING_INPUT_PRICE_PER_M
+    logger.info("[EMBEDDING] Embedding %d text(s) | model=%s | purpose=%s", len(texts), embed_model, purpose)
     for batch_number, start in enumerate(range(0, len(texts), EMBED_BATCH_SIZE), start=1):
         batch = texts[start:start + EMBED_BATCH_SIZE]
         for attempt in range(3):
@@ -339,6 +334,13 @@ def get_embeddings(texts, purpose="embedding", token_tracker=None, language=None
                 response.raise_for_status()
                 break
             except (requests.RequestException, requests.HTTPError) as error:
+                status = getattr(getattr(error, "response", None), "status_code", None)
+                if status in (401, 402, 403, 404):
+                    hint = {401: "invalid API key", 402: "OpenRouter credit exhausted - add credit",
+                            403: "access denied", 404: "embedding model not found"}[status]
+                    logger.error("[EMBEDDING] Request failed with HTTP %s (%s); not retrying: %s",
+                                 status, hint, error)
+                    raise
                 if attempt == 2:
                     raise
                 logger.warning(
@@ -434,44 +436,60 @@ def ingest_document(document_path, name=None, progress_callback=None):
     if suffix not in (".pdf", ".parquet", ".pq"):
         raise ValueError(f"Unsupported document format: {suffix}")
     file_hash = file_sha256(document_path)
-    if (
-        get_chroma_collection("en").get(where={"file_hash": file_hash}, limit=1)["ids"]
-        or get_chroma_collection("ar").get(where={"file_hash": file_hash}, limit=1)["ids"]
-    ):
-        logger.debug("%s is unchanged, skipping", name)
-        return "unchanged", 0
+    collection = get_chroma_collection()
 
-    get_chroma_collection("en").delete(where={"source": name})
-    get_chroma_collection("ar").delete(where={"source": name})
+    # Chunks already stored for this exact file content (a previous run may have been
+    # interrupted, e.g. by exhausted API credit, leaving the file only partly indexed).
+    existing_ids = set(collection.get(where={"file_hash": file_hash}, include=[])["ids"])
+    declared_total = None
+    if existing_ids:
+        first = collection.get(where={"file_hash": file_hash}, limit=1, include=["metadatas"])
+        declared_total = (first["metadatas"][0] or {}).get("total_chunks")
+        if declared_total is not None and len(existing_ids) >= declared_total:
+            logger.info("[STAGE: INDEXING] %s is unchanged and complete (%d chunks, hash %s), skipping",
+                        name, len(existing_ids), file_hash[:12])
+            return "unchanged", 0
 
-    chunks = split_text_to_chunks(extract_document(document_path))
+    # An older version of the same file name is replaced; this version's chunks are kept.
+    collection.delete(where={"$and": [{"source": name}, {"file_hash": {"$ne": file_hash}}]})
+
+    logger.info("[STAGE: INDEXING] Extracting text from %s ...", name)
+    text = extract_document(document_path)
+    chunks = split_text_to_chunks(text)
     if not chunks:
-        logger.warning("No text could be extracted from %s", name)
+        logger.warning("[STAGE: INDEXING] No text could be extracted from %s", name)
         return "empty", 0
 
     total = len(chunks)
-    logger.info("[STAGE: INDEXING] Embedding and indexing %s (%d chunks)...", name, total)
+    if existing_ids and declared_total is not None and declared_total != total:
+        logger.warning("[STAGE: INDEXING] %s: chunking changed (%s -> %d chunks); restarting this file",
+                       name, declared_total, total)
+        collection.delete(where={"file_hash": file_hash})
+        existing_ids = set()
+    ids_all = [f"{file_hash[:16]}_{position}" for position in range(total)]
+    pending = [position for position, chunk_id in enumerate(ids_all) if chunk_id not in existing_ids]
+    if not pending:
+        logger.info("[STAGE: INDEXING] %s is already fully indexed (%d chunks), skipping", name, total)
+        return "unchanged", 0
+    if existing_ids:
+        logger.warning(
+            "[STAGE: INDEXING] RESUMING %s: %d/%d chunks already stored, embedding the remaining %d",
+            name, len(existing_ids), total, len(pending),
+        )
+    logger.info(
+        "[STAGE: INDEXING] Extracted %d characters -> %d chunks (size=%d, overlap=%d) | embedding %d with %s ...",
+        len(text), total, CHUNK_SIZE, OVERLAP, len(pending), EMBED_MODEL,
+    )
     document_embedding_cost = 0.0
     document_embedding_tokens = 0
-    for language in ("en", "ar"):
-        language_chunks = [
-            (position, chunk)
-            for position, chunk in enumerate(chunks)
-            if detect_language(chunk) == language
-        ]
-        if not language_chunks:
-            continue
-        collection = get_chroma_collection(language)
-        embed_model = ARABIC_EMBED_MODEL if language == "ar" else EMBED_MODEL
-        for start in range(0, len(language_chunks), EMBED_BATCH_SIZE):
-            batch_items = language_chunks[start:start + EMBED_BATCH_SIZE]
-            batch = [chunk for _, chunk in batch_items]
+    stored = len(existing_ids)
+    try:
+        for start in range(0, len(pending), EMBED_BATCH_SIZE):
+            positions = pending[start:start + EMBED_BATCH_SIZE]
+            batch = [chunks[position] for position in positions]
             batch_usage = {}
             batch_vectors = get_embeddings(
-                batch,
-                purpose=f"indexing:{name}",
-                token_tracker=batch_usage,
-                language=language,
+                batch, purpose=f"indexing:{name}", token_tracker=batch_usage,
             )
             document_embedding_cost += batch_usage.get("embedding_cost", 0.0)
             document_embedding_tokens += batch_usage.get("embedding_input_tokens", 0)
@@ -481,81 +499,83 @@ def ingest_document(document_path, name=None, progress_callback=None):
                 metadatas=[{
                     "source": name,
                     "file_hash": file_hash,
-                    "embed_model": embed_model,
-                    "language": language,
+                    "embed_model": EMBED_MODEL,
+                    "total_chunks": total,
                 }] * len(batch),
-                ids=[
-                    f"{file_hash[:16]}_{language}_{position}"
-                    for position, _ in batch_items
-                ],
+                ids=[ids_all[position] for position in positions],
             )
-        logger.debug("Stored language=%s chunks of %s", language, name)
-    for done in range(0, total, EMBED_BATCH_SIZE):
-        done_count = min(done + EMBED_BATCH_SIZE, total)
-        if progress_callback:
-            progress_callback(done_count, total)
+            stored += len(batch)
+            logger.info("[STAGE: INDEXING] %s: stored %d/%d chunks", name, stored, total)
+            if progress_callback:
+                progress_callback(stored, total)
+    except Exception:
+        logger.error(
+            "[STAGE: INDEXING] %s INTERRUPTED at %d/%d chunks. Progress is kept; fix the cause "
+            "(e.g. add API credit) and run again to resume from here.", name, stored, total,
+        )
+        raise
     logger.info(
         "[DOCUMENT EMBEDDING COST] file=%s | model=%s | chunks=%d | input_tokens=%d | "
         "total_cost=$%.10f USD",
-        name, EMBED_MODEL, total, document_embedding_tokens, document_embedding_cost,
+        name, EMBED_MODEL, len(pending), document_embedding_tokens, document_embedding_cost,
     )
     logger.info("Indexed %s: %d chunks", name, total)
     return "added", total
 
 
 def build_index():
-    """Make sure every PDF in DOCS_DIR is indexed.
+    """Make sure every PDF/Parquet file in DOCS_DIR is indexed.
 
-    Unchanged PDFs are skipped quickly. If the embedding model changed since the
-    index was built, the whole collection is rebuilt.
+    Unchanged files are skipped quickly. Old language-split collections are dropped
+    (they used different embedding spaces), and if the embedding model changed since
+    the index was built the collection is rebuilt.
     """
-    collection = get_chroma_collection("en")
+    client = chromadb.PersistentClient(path=CHROMA_PATH)
+    existing = {c.name if hasattr(c, "name") else str(c) for c in client.list_collections()}
+    for legacy in LEGACY_COLLECTIONS:
+        if legacy in existing:
+            logger.warning("[INDEX] Dropping legacy collection %r (old language-split index); documents will be re-indexed", legacy)
+            client.delete_collection(name=legacy)
+
+    collection = get_chroma_collection()
     if collection.count() > 0:
         sample = collection.get(limit=1, include=["metadatas"])["metadatas"][0]
-        if sample.get("embed_model") != EMBED_MODEL or "language" not in sample:
-            logger.warning("Embedding model changed (or old index format). Rebuilding the index.")
-            chromadb.PersistentClient(path=CHROMA_PATH).delete_collection(name="docs")
-            try:
-                chromadb.PersistentClient(path=CHROMA_PATH).delete_collection(name="arabic_docs")
-            except Exception:
-                pass
-    arabic_collection = get_chroma_collection("ar")
-    if arabic_collection.count() > 0:
-        sample = arabic_collection.get(limit=1, include=["metadatas"])["metadatas"][0]
-        if sample.get("embed_model") != ARABIC_EMBED_MODEL:
-            logger.warning("Arabic embedding model changed. Rebuilding the Arabic index.")
-            chromadb.PersistentClient(path=CHROMA_PATH).delete_collection(name="arabic_docs")
+        if sample.get("embed_model") != EMBED_MODEL:
+            logger.warning(
+                "[INDEX] Embedding model changed (%r -> %r). Rebuilding the index.",
+                sample.get("embed_model"), EMBED_MODEL,
+            )
+            client.delete_collection(name=COLLECTION_NAME)
 
     document_paths = sorted(
         path for path in DOCS_DIR.iterdir()
         if path.suffix.lower() in (".pdf", ".parquet", ".pq")
     )
+    logger.info("[INDEX] Checking %d document(s) in %s", len(document_paths), DOCS_DIR)
     for pdf_path in document_paths:
-        status, _ = ingest_document(pdf_path)
+        status, chunk_count = ingest_document(pdf_path)
         if status == "unchanged":
-            logger.debug("%s: already indexed", pdf_path.name)
+            logger.info("[INDEX] %s: already indexed", pdf_path.name)
         elif status == "empty":
-            logger.warning("No text found in %s, skipping", pdf_path.name)
+            logger.warning("[INDEX] No text found in %s, skipping", pdf_path.name)
+        else:
+            logger.info("[INDEX] %s: indexed %d chunks", pdf_path.name, chunk_count)
     return get_chroma_collection()
 
 
 def list_documents():
     """Return {file name: chunk count} for everything currently indexed."""
-    metas = []
-    for language in ("en", "ar"):
-        collection = get_chroma_collection(language)
-        if collection.count():
-            metas.extend(collection.get(include=["metadatas"])["metadatas"])
-    if not metas:
+    collection = get_chroma_collection()
+    if not collection.count():
         return {}
+    metas = collection.get(include=["metadatas"])["metadatas"]
     return dict(Counter(m["source"] for m in metas))
 
 
 def delete_document(name):
     """Remove a document from the index (and from DOCS_DIR if it is there)."""
     logger.info("Deleting document %s from the index", name)
-    get_chroma_collection("en").delete(where={"source": name})
-    get_chroma_collection("ar").delete(where={"source": name})
+    get_chroma_collection().delete(where={"source": name})
     path = DOCS_DIR / Path(name).name
     if path.exists():
         path.unlink()
@@ -564,6 +584,51 @@ def delete_document(name):
 # --------------------------------------------------------------------------- #
 # Retrieval, clustering, reranking, and subset construction
 # --------------------------------------------------------------------------- #
+CROSS_LINGUAL_RETRIEVAL = os.getenv("CROSS_LINGUAL_RETRIEVAL", "1").strip().lower() not in (
+    "0", "false", "no", "off",
+)
+
+CROSS_LINGUAL_PROMPT = """Translate the search question below so that it can also be matched against
+documents written in the other language.
+- If the question is in Arabic, translate it into English.
+- If the question is in English, translate it into Modern Standard Arabic.
+- If it mixes both, translate it into whichever of the two (Arabic or English) is NOT dominant.
+Keep names, numbers and dates exact. Do NOT answer the question.
+Output only the translated question, nothing else.
+
+Question: {question}
+
+Translation:"""
+
+
+def translate_question_for_retrieval(question, token_tracker=None):
+    """Return the question translated into the other language (Arabic <-> English), or None.
+
+    No language is detected in code: the model is told to flip Arabic to English and
+    English to Arabic. If it fails, retrieval simply continues with the original question.
+    """
+    started = time.perf_counter()
+    try:
+        translated = _call_openrouter_text(
+            CROSS_LINGUAL_PROMPT.format(question=question), DRAFT_MODEL,
+            "query translation", token_tracker=token_tracker,
+            reasoning={"enabled": False},
+            timeout=SHORT_TASK_TIMEOUT, attempts=SHORT_TASK_ATTEMPTS,
+        )
+    except Exception:
+        logger.exception("[CROSS-LINGUAL] Query translation failed; searching with the original question only")
+        return None
+    translated = " ".join(translated.split()).strip().strip('"')
+    if not translated or len(translated) > max(300, 4 * len(question)):
+        logger.warning("[CROSS-LINGUAL] Discarding unusable translation: %r", translated[:120])
+        return None
+    logger.info(
+        "[CROSS-LINGUAL] Query translated in %.2fs | original=%r | translated=%r",
+        time.perf_counter() - started, question, translated,
+    )
+    return translated
+
+
 def retrieve(question, k=DEFAULT_RETRIEVAL_K, return_distances=False, source=None, token_tracker=None):
     """
     Return the top-k retrieved chunks, metadata, and embeddings.
@@ -572,15 +637,15 @@ def retrieve(question, k=DEFAULT_RETRIEVAL_K, return_distances=False, source=Non
     Set return_distances=True to also receive ChromaDB cosine distances.
     Lower cosine distance means greater similarity to the question.
 
-    If `source` is given (an indexed PDF file name), only chunks from that
-    document are searched, so other PDFs cannot distract the model.
+    Retrieval is language-agnostic: one multilingual embedding model and one collection
+    serve every language. With CROSS_LINGUAL_RETRIEVAL on (default) the question is also
+    translated into the other language (Arabic <-> English) and searched too; each chunk
+    keeps its best (lowest) distance across the searches.
+
+    If `source` is given (an indexed file name), only chunks from that
+    document are searched, so other documents cannot distract the model.
     """
-    language = detect_language(question)
-    collection = get_chroma_collection(language)
-    logger.info("[LANGUAGE ROUTING] question_language=%s | embedding_model=%s | collection=%s",
-                language,
-                ARABIC_EMBED_MODEL if language == "ar" else EMBED_MODEL,
-                "arabic_docs" if language == "ar" else "docs")
+    collection = get_chroma_collection()
     where = {"source": source} if source else None
     if where:
         count = len(collection.get(where=where, include=[])["ids"])
@@ -588,37 +653,64 @@ def retrieve(question, k=DEFAULT_RETRIEVAL_K, return_distances=False, source=Non
         count = collection.count()
     if count == 0:
         if source:
-            logger.warning("Retrieval skipped: no chunks indexed for %r", source)
+            logger.warning("[RETRIEVAL] Skipped: no chunks indexed for %r", source)
         else:
-            logger.warning("Retrieval skipped: the index is empty")
+            logger.warning("[RETRIEVAL] Skipped: the index is empty")
         empty = ([], [], np.array([]))
         return (*empty, np.array([])) if return_distances else empty
     if k < 1:
         raise ValueError("Retrieval k must be at least 1.")
 
-    logger.debug(
-        "Retrieving the top %d of %d chunks (scope: %s)",
-        min(k, count), count, source or "all documents",
+    queries = [("original", question)]
+    if CROSS_LINGUAL_RETRIEVAL:
+        translated = translate_question_for_retrieval(question, token_tracker=token_tracker)
+        if translated and translated != question:
+            queries.append(("translated", translated))
+    logger.info(
+        "[RETRIEVAL] Searching %d of %d chunks (scope: %s) with %d query variant(s) | embedding_model=%s | collection=%s",
+        min(k, count), count, source or "all documents", len(queries), EMBED_MODEL, COLLECTION_NAME,
     )
-    q_emb = get_embeddings(
-        [question],
-        purpose="question-retrieval",
-        token_tracker=token_tracker,
-        language=language,
-    )[0]
-    query_args = dict(
-        query_embeddings=[q_emb],
-        n_results=min(k, count),
-        include=["documents", "metadatas", "embeddings", "distances"],
-    )
-    if where:
-        query_args["where"] = where
-    result = collection.query(**query_args)
 
-    documents = result["documents"][0]
-    metadatas = result["metadatas"][0]
-    embeddings = np.array(result["embeddings"][0])
-    distances = np.array(result["distances"][0], dtype=float)
+    query_embeddings = get_embeddings(
+        [text for _, text in queries], purpose="question-retrieval", token_tracker=token_tracker,
+    )
+    n_results = min(k, count)
+    merged = {}  # chunk id -> (document, metadata, embedding, distance, query label)
+    for (label, text), q_emb in zip(queries, query_embeddings):
+        query_args = dict(
+            query_embeddings=[q_emb],
+            n_results=n_results,
+            include=["documents", "metadatas", "embeddings", "distances"],
+        )
+        if where:
+            query_args["where"] = where
+        result = collection.query(**query_args)
+        ids = result["ids"][0]
+        distances = result["distances"][0]
+        logger.info(
+            "[RETRIEVAL] Query %-10s | %r | hits=%d | best_distance=%.4f | worst_distance=%.4f",
+            label, text, len(ids),
+            min(distances) if len(distances) else float("nan"),
+            max(distances) if len(distances) else float("nan"),
+        )
+        for chunk_id, doc, meta, emb, dist in zip(
+            ids, result["documents"][0], result["metadatas"][0],
+            result["embeddings"][0], distances,
+        ):
+            if chunk_id not in merged or dist < merged[chunk_id][3]:
+                merged[chunk_id] = (doc, meta, emb, float(dist), label)
+
+    ranked = sorted(merged.values(), key=lambda item: item[3])[:n_results]
+    from_counts = Counter(item[4] for item in ranked)
+    logger.info(
+        "[RETRIEVAL] Merged %d unique chunk(s) -> kept top %d | best query per chunk: %s",
+        len(merged), len(ranked), dict(from_counts),
+    )
+
+    documents = [item[0] for item in ranked]
+    metadatas = [item[1] for item in ranked]
+    embeddings = np.array([item[2] for item in ranked])
+    distances = np.array([item[3] for item in ranked], dtype=float)
 
     if return_distances:
         return documents, metadatas, embeddings, distances
@@ -837,6 +929,18 @@ Documents:
 
 Question: {question}
 
+Language rules:
+- The question and the documents may be in different languages (Arabic or English).
+  Read and understand the documents whatever language they are written in.
+- Write the "answer" in the SAME language as the question. If the question is in
+  Arabic, answer in clear Modern Standard Arabic even when the documents are in
+  English; if the question is in English, answer in English even when the documents
+  are in Arabic.
+- Keep the "rationale" quote exactly as written in the document (original language,
+  not translated).
+- Copy proper names, titles, dates and numbers exactly. When you translate a name
+  into the answer language, you may keep the original in parentheses.
+
 Return JSON with exactly two keys, in this order: "rationale" first, then "answer".
 - "rationale": an exact short quote from the documents that supports the answer,
   then briefly which document it came from. First locate the sentence containing
@@ -853,13 +957,16 @@ If the documents do not contain the answer, say so in the answer.
 
 
 def _call_openrouter_text(prompt, model, stage_label, token_tracker=None, json_mode=False,
-                          reasoning=None):
+                          reasoning=None, timeout=VERIFY_TIMEOUT, max_tokens=None,
+                          temperature=0, attempts=3):
     """Call an OpenRouter chat model and return its text response."""
     payload = {
         "model": model,
         "messages": [{"role": "user", "content": prompt}],
-        "temperature": 0,
+        "temperature": temperature,
     }
+    if max_tokens:
+        payload["max_tokens"] = max_tokens
     if json_mode:
         payload["response_format"] = {"type": "json_object"}
     payload["usage"] = {"include": True}
@@ -868,7 +975,7 @@ def _call_openrouter_text(prompt, model, stage_label, token_tracker=None, json_m
 
     response = None
     started = time.perf_counter()
-    for attempt in range(3):
+    for attempt in range(attempts):
         try:
             response = requests.post(
                 OPENROUTER_CHAT_URL,
@@ -877,10 +984,10 @@ def _call_openrouter_text(prompt, model, stage_label, token_tracker=None, json_m
                     "Content-Type": "application/json",
                 },
                 json=payload,
-                timeout=VERIFY_TIMEOUT,
+                timeout=timeout,
             )
         except requests.RequestException as error:
-            if attempt == 2:
+            if attempt == attempts - 1:
                 raise VerifierHTTPError(None, f"network error: {error}") from error
             time.sleep(2 ** attempt)
             continue
@@ -892,7 +999,7 @@ def _call_openrouter_text(prompt, model, stage_label, token_tracker=None, json_m
             response.status_code, response.text[:300],
             float(retry_after) if retry_after and retry_after.replace(".", "", 1).isdigit() else None,
         )
-        if response.status_code in (401, 402, 403, 404) or attempt == 2:
+        if response.status_code in (401, 402, 403, 404) or attempt == attempts - 1:
             raise api_error
         time.sleep(api_error.retry_after + 1 if api_error.retry_after else 2 ** attempt)
 
@@ -943,26 +1050,84 @@ def _call_openrouter_text(prompt, model, stage_label, token_tracker=None, json_m
     return content
 
 
-def draft(question, subset, draft_idx=None, token_tracker=None, language=None):
-    """Generate one draft answer + rationale using the configured OpenRouter drafting model."""
+_FATAL_DRAFT_STATUSES = (401, 402, 403, 404)
+
+
+def draft(question, subset, draft_idx=None, token_tracker=None):
+    """Generate one draft answer + rationale using the configured OpenRouter drafting model.
+
+    A draft that times out, returns an empty reply or hits a transient provider error is
+    retried (the retry disables reasoning and uses a little temperature to break loops).
+    If every attempt fails the draft is returned as a placeholder so one bad draft never
+    stalls or aborts the whole question. Auth/credit errors (401-404) still propagate.
+    """
     docs_text = "\n\n".join(f"[{i}] {d}" for i, d in enumerate(subset, start=1))
     prompt = DRAFT_PROMPT.format(docs=docs_text, question=question)
-    language = language or detect_language(question)
     model = DRAFT_MODEL
-    if language == "ar":
-        prompt += "\n\nLanguage requirement: Answer in clear Modern Standard Arabic. Preserve Arabic names and terms exactly when supported by the documents."
     label = f"Draft {draft_idx}" if draft_idx is not None else "Draft"
-    logger.debug("Calling OpenRouter drafting model %s for %s with %d chunks (language=%s)", model, label, len(subset), language)
-    raw = _call_openrouter_text(
-        prompt, model, label, token_tracker=token_tracker, json_mode=True,
-        reasoning=DRAFT_REASONING_PARAM,
-    )
+    logger.info("[DRAFT] Calling %s for %s with %d chunks", model, label, len(subset))
+
+    raw = None
+    last_error = None
+    for attempt in range(DRAFT_ATTEMPTS):
+        retrying = attempt > 0
+        try:
+            raw = _call_openrouter_text(
+                prompt, model, label if not retrying else f"{label} (retry {attempt})",
+                token_tracker=token_tracker, json_mode=True,
+                # On a retry, force reasoning off and add a little randomness: greedy
+                # decoding is what tends to get stuck in repetition loops.
+                reasoning=({"enabled": False} if retrying else DRAFT_REASONING_PARAM),
+                timeout=DRAFT_TIMEOUT, max_tokens=DRAFT_MAX_TOKENS,
+                temperature=0.3 if retrying else 0, attempts=1,
+            )
+            break
+        except VerifierHTTPError as error:
+            if error.status in _FATAL_DRAFT_STATUSES:
+                raise
+            last_error = error
+        except ValueError as error:  # empty response / unexpected body
+            last_error = error
+        logger.warning("[DRAFT] %s attempt %d/%d failed: %s",
+                       label, attempt + 1, DRAFT_ATTEMPTS, last_error)
+
+    if raw is None:
+        logger.error("[DRAFT] %s failed after %d attempts: %s", label, DRAFT_ATTEMPTS, last_error)
+        return {"answer": DRAFT_FAILED_TEXT, "rationale": "", "failed": True}
+
     try:
         data = _extract_json(raw)
-        return {"answer": str(data.get("answer", "")), "rationale": str(data.get("rationale", ""))}
+        result = {"answer": str(data.get("answer", "")), "rationale": str(data.get("rationale", ""))}
+        logger.info("[DRAFT] %s answer=%r", label, result["answer"])
+        return result
     except (ValueError, AttributeError):
         logger.warning("%s was not valid JSON, using the raw text instead", label)
         return {"answer": raw, "rationale": ""}
+
+
+def run_drafts(question, groups, token_tracker=None):
+    """Draft every evidence group in parallel. Never raises for a single bad draft.
+
+    Returns the drafts in the same order as `groups`; failed ones carry failed=True.
+    """
+    with ThreadPoolExecutor(max_workers=max(1, len(groups))) as pool:
+        futures = [
+            pool.submit(draft, question, group, index + 1, token_tracker)
+            for index, group in enumerate(groups)
+        ]
+        drafts = []
+        for index, future in enumerate(futures, start=1):
+            try:
+                drafts.append(future.result())
+            except VerifierHTTPError:
+                raise  # auth / credits / unknown model: nothing will work, surface it
+            except Exception as error:
+                logger.exception("Draft %d crashed", index)
+                drafts.append({"answer": DRAFT_FAILED_TEXT, "rationale": "", "failed": True})
+    failed = [i for i, d in enumerate(drafts, start=1) if d.get("failed")]
+    if failed:
+        logger.warning("[DRAFTING] %d/%d drafts failed: %s", len(failed), len(drafts), failed)
+    return drafts
 
 
 # --------------------------------------------------------------------------- #
@@ -987,6 +1152,11 @@ Scoring rules:
   actually present in the passages.
 - Do not reward length, verbosity, confident wording, or stylistic polish.
 - The rationale is supporting material, not a substitute for a correct answer.
+- The question, passages and candidates may be in different languages (Arabic or
+  English). Judge by meaning: a candidate that correctly translates a fact from the
+  passages is fully supported. Do not penalize a candidate for answering in a
+  different language than the passages; when candidates are otherwise equal, prefer
+  the one written in the language of the question.
 
 Question:
 {question}
@@ -1030,6 +1200,9 @@ Strict restrictions:
 - Do NOT choose based on writing style alone.
 - Do NOT assume the answer with more details is better.
 - Do NOT reward a candidate for repeating the question.
+- The question, passages and candidates may be in different languages (Arabic or
+  English). Judge by meaning, not by language; when otherwise equal, prefer the
+  candidate written in the language of the question.
 - A single important factual error can make an otherwise polished answer worse.
 - Do not combine candidates or write a new answer. Select one existing candidate.
 - You MUST return one winner even if the candidates are very similar. If they
@@ -1094,12 +1267,10 @@ def _extract_json(text):
         return json.loads(match.group(0))
 
 
-def call_verifier(prompt, stage_label="verify", token_tracker=None, language=None):
+def call_verifier(prompt, stage_label="verify", token_tracker=None):
     """Send one prompt to the OpenRouter model and return the parsed JSON reply."""
     started = time.perf_counter()
     model = VERIFY_MODEL
-    if language == "ar":
-        prompt += "\n\nLanguage requirement: The question and expected answer language are Arabic. Evaluate Arabic and English evidence faithfully and return JSON keys as specified."
     try:
         response = requests.post(
             OPENROUTER_CHAT_URL,
@@ -1213,7 +1384,7 @@ def _build_verification_inputs(drafts, subsets):
     return source_documents, candidates
 
 
-def resolve_tie(question, source_documents, candidates, tied_indexes, retries=3, token_tracker=None, language=None):
+def resolve_tie(question, source_documents, candidates, tied_indexes, retries=3, token_tracker=None):
     """Ask the verifier to choose exactly one of the drafts tied for the highest score."""
     tied_candidates = [
         candidate for candidate in candidates
@@ -1232,7 +1403,6 @@ def resolve_tie(question, source_documents, candidates, tied_indexes, retries=3,
                 prompt,
                 stage_label="tie-break",
                 token_tracker=token_tracker,
-                language=language,
             )
             winner = data.get("winner_index")
             reason = str(data.get("reason", "")).strip()
@@ -1257,7 +1427,7 @@ def resolve_tie(question, source_documents, candidates, tied_indexes, retries=3,
     ) from last_error
 
 
-def verify(question, drafts, subsets, retries=5, token_tracker=None, language=None):
+def verify(question, drafts, subsets, retries=5, token_tracker=None):
     """Score drafts, then use a second verifier call only if the top score is tied."""
     if not drafts:
         raise ValueError("Cannot verify an empty list of drafts")
@@ -1282,7 +1452,6 @@ def verify(question, drafts, subsets, retries=5, token_tracker=None, language=No
                 attempt_prompt,
                 stage_label="scoring",
                 token_tracker=token_tracker,
-                language=language,
             )
             raw_scores = data["scores"]
             if isinstance(raw_scores, dict):
@@ -1304,10 +1473,10 @@ def verify(question, drafts, subsets, retries=5, token_tracker=None, language=No
                 )
                 best, tie_reason = resolve_tie(
                     question, source_documents, candidates, tied,
-                    token_tracker=token_tracker, language=language
+                    token_tracker=token_tracker,
                 )
-            logger.debug(
-                "Verifier scores: %s, best draft: %d; tie decision: %s",
+            logger.info(
+                "[VERIFY] Scores: %s | best draft: %d | decision: %s",
                 scores, best + 1, tie_reason,
             )
             return scores, best, tie_reason, drafts[best]["answer"]
@@ -1339,6 +1508,7 @@ Rules:
 - Do NOT answer the question.
 - Do NOT add facts or details that are not in the conversation.
 - Keep the user's wording and intent; only resolve the references.
+- Write the standalone question in the SAME language as the new question.
 - Output only the question text, nothing else.
 
 Conversation:
@@ -1366,12 +1536,13 @@ def rewrite_question(question, history, token_tracker=None):
         text = " ".join(str(m["content"]).split())[:HISTORY_CHARS]
         lines.append(f"{speaker}: {text}")
     prompt = REWRITE_PROMPT.format(history="\n".join(lines), question=question)
-    language = detect_language(question)
     model = DRAFT_MODEL
-    logger.info("[STAGE: REWRITING] Resolving follow-up question context with OpenRouter (%s, language=%s)...", model, language)
+    logger.info("[STAGE: REWRITING] Resolving follow-up question context with OpenRouter (%s)...", model)
     try:
         rewritten = _call_openrouter_text(
             prompt, model, "question rewrite", token_tracker=token_tracker,
+            reasoning={"enabled": False},
+            timeout=SHORT_TASK_TIMEOUT, attempts=SHORT_TASK_ATTEMPTS,
         )
         rewritten = " ".join(rewritten.split()).strip().strip('"')
     except Exception:
@@ -1491,8 +1662,7 @@ def answer_question(
         raise ValueError("Only the 'subsets' strategy is supported.")
 
     pipeline_start = time.perf_counter()
-    language = detect_language(question)
-    logger.info("[LANGUAGE ROUTING] Selected language pipeline: %s", "Arabic" if language == "ar" else "English")
+    logger.info("[LANGUAGE] No language routing: one multilingual index, answer follows the question's language")
     raw_q_tokens = count_question_tokens(question)
     logger.info(
         "[STAGE 0/4: START] Received question | question_tokens=%d | scope=%s | question=%r",
@@ -1528,8 +1698,8 @@ def answer_question(
 
     final_q_tokens = count_question_tokens(question)
     logger.info(
-        "[STAGE 1/4: RETRIEVING] Embedding question (%d tokens) and searching ChromaDB for top-k=%d chunks (scope=%s)...",
-        final_q_tokens, k, source or "all documents",
+        "[STAGE 1/4: RETRIEVING] Embedding question (%d tokens) and searching ChromaDB (multilingual, cross-lingual=%s) for top-k=%d chunks (scope=%s)...",
+        final_q_tokens, CROSS_LINGUAL_RETRIEVAL, k, source or "all documents",
     )
     docs, metas, embs, distances = retrieve(
         question, k=k, return_distances=True, source=source, token_tracker=token_tracker
@@ -1577,19 +1747,21 @@ def answer_question(
         "[STAGE 3/4: DRAFTING] Generating %d drafts, one per %s...",
         len(evidence_groups), group_name,
     )
-    with ThreadPoolExecutor(max_workers=len(evidence_groups)) as pool:
-        futures = [
-            pool.submit(draft, question, group, index + 1, token_tracker, language)
-            for index, group in enumerate(evidence_groups)
-        ]
-        drafts = [future.result() for future in futures]
+    drafts = run_drafts(question, evidence_groups, token_tracker)
+    if all(d.get("failed") for d in drafts):
+        logger.error("All drafts failed; skipping verification")
+        return (
+            "I couldn't generate an answer right now (the drafting model did not respond). "
+            "Please try again in a moment.",
+            [],
+        )
 
     logger.info(
         "[STAGE 4/4: VERIFYING] Sending %d drafts for verification...",
         len(drafts),
     )
     scores, best, tie_reason, final_answer = verify(
-        question, drafts, evidence_groups, token_tracker=token_tracker, language=language
+        question, drafts, evidence_groups, token_tracker=token_tracker,
     )
 
     trace_generation(drafts, scores, best, positions, final_answer, group_name=group_name)

@@ -97,6 +97,7 @@ from Speculative_RAG import (  # noqa: E402
     cluster,
     build_subsets,
     draft,
+    run_drafts,
     verify,
     count_question_tokens,
     count_output_tokens,
@@ -107,7 +108,6 @@ from Speculative_RAG import (  # noqa: E402
     DRAFT_MODEL,
     DRAFT_REASONING,
     VERIFY_MODEL,
-    detect_language,
 )
 
 EVAL_PATH = SESSION_DIR / "JSON-Test-cases/cluster_comparison_ground_truth.json"
@@ -178,17 +178,13 @@ def run_drafts_and_verification(question, subsets, token_tracker=None, method=No
     `method` only controls the stage lines that are printed (e.g. "SUBSETS")."""
     if method:
         stage(progress, method, f"STAGE 1/2 drafting: {len(subsets)} drafts in parallel ...")
-    with ThreadPoolExecutor(max_workers=len(subsets)) as pool:
-        futures = [
-            pool.submit(draft, question, subset, i + 1, token_tracker, detect_language(question))
-            for i, subset in enumerate(subsets)
-        ]
-        drafts = [f.result() for f in futures]
+    drafts = run_drafts(question, subsets, token_tracker)
+    if all(d.get("failed") for d in drafts):
+        raise RuntimeError("All drafts failed (drafting model timed out or returned empty replies)")
     if method:
         stage(progress, method, f"STAGE 2/2 verifying: scoring {len(drafts)} drafts ...")
     scores, best, tie_reason, final_answer = verify(
         question, drafts, subsets, token_tracker=token_tracker,
-        language=detect_language(question),
     )
     return {
         "answer": final_answer,
@@ -223,8 +219,33 @@ def concept_groups(item):
     return [[truths] if isinstance(truths, str) else list(truths)]
 
 
+_ARABIC_MARKS = re.compile(r"[\u064b-\u065f\u0670\u06d6-\u06ed\u0640]")   # diacritics + tatweel
+_ARABIC_FOLD = str.maketrans({
+    "\u0623": "\u0627", "\u0625": "\u0627", "\u0622": "\u0627", "\u0671": "\u0627",  # alef forms -> alef
+    "\u0649": "\u064a",                                                              # alef maqsura -> ya
+    "\u0629": "\u0647",                                                              # ta marbuta -> ha
+    **{chr(0x0660 + i): str(i) for i in range(10)},                                  # Arabic-Indic digits
+    **{chr(0x06F0 + i): str(i) for i in range(10)},                                  # Persian digits
+})
+
+
 def _norm(text):
-    return re.sub(r"[^\w\u0600-\u06ff]+", " ", str(text).casefold(), flags=re.UNICODE).strip()
+    """Casefold, fold Arabic spelling variants (diacritics, alef/ya/ta-marbuta, digits), drop punctuation."""
+    text = _ARABIC_MARKS.sub("", str(text).casefold()).translate(_ARABIC_FOLD)
+    return re.sub(r"[^\w\u0600-\u06ff]+", " ", text, flags=re.UNICODE).strip()
+
+
+def evidence_item(item):
+    """The item as seen by the *chunk* checks (retrieval metrics, subset coverage).
+
+    Cross-language test cases have `required_concepts` written in the language of the
+    question/answer, while the retrieved chunks are in the document's language. Such a
+    case also carries `evidence_concepts` (document language); when present they replace
+    `required_concepts` for every check made on chunks. Answers are always checked with
+    `required_concepts`.
+    """
+    evidence = item.get("evidence_concepts")
+    return {**item, "required_concepts": evidence} if evidence else item
 
 
 def _has_phrase(norm_text, phrase):
@@ -248,7 +269,7 @@ def retrieval_metrics(docs, item, cutoffs):
     Retrieval quality of the ranked chunk list, without gold chunk labels.
     A concept group counts as retrieved when any of its phrases appears in a chunk.
     """
-    groups = concept_groups(item)
+    groups = concept_groups(evidence_item(item))
     n_groups = len(groups)
     per_chunk = [groups_found(doc, groups) for doc in docs]
 
@@ -375,10 +396,10 @@ def score_speculative(item, subsets, positions, generated, construction_seconds,
         "subset_chunk_positions": positions,
         "final_correct": final_correct,
         "oracle_draft_correct": any(matches_item(d["answer"], item) for d in generated["drafts"]),
-        "subset_hit": any(matches_item(doc, item) for subset in subsets for doc in subset),
+        "subset_hit": any(matches_item(doc, evidence_item(item)) for subset in subsets for doc in subset),
         "answer_concept_recall": concept_coverage(generated["answer"], item),
         "best_subset_concept_coverage": max(
-            concept_coverage(" ".join(subset), item) for subset in subsets
+            concept_coverage(" ".join(subset), evidence_item(item)) for subset in subsets
         ),
         **structure,
         "subset_construction_seconds": construction_seconds,
@@ -555,7 +576,9 @@ def begin_trace_file(path, title):
 
 def score_one_question(item, k, subsets_only, progress=""):
     question = item["question"]
-    language = detect_language(question)
+    # Optional label from the test-case JSON (e.g. "question_language": "ar"); used only
+    # for the per-language report, never for routing.
+    language = item.get("question_language") or item.get("language")
     source = item.get("source") or None
     q_tokens = count_question_tokens(question)
     logger.info("Evaluating %s | question_tokens=%d", item.get("id", "?"), q_tokens)
@@ -571,6 +594,8 @@ def score_one_question(item, k, subsets_only, progress=""):
         "ground_truth": item["ground_truth"],
         "source": source,
         "language": language,
+        "doc_language": item.get("doc_language"),
+        "cross_language": bool(item.get("cross_language")),
         "draft_model": DRAFT_MODEL,
         "verifier_model": VERIFY_MODEL,
     }
@@ -673,7 +698,6 @@ def score_one_question(item, k, subsets_only, progress=""):
             docs,
             draft_idx="baseline",
             token_tracker=token_tracker,
-            language=detect_language(question),
         )["answer"]
         baseline_error = None
     except Exception as error:
@@ -910,8 +934,22 @@ def build_report(results, k, subsets_only):
                 pct(summary_row(group)["concept_recall"]),
             ])
     if language_rows:
-        out += ["", "## 2. Accuracy by language", "",
+        out += ["", "## 2. Accuracy by question language", "",
                 md_table(["Language", "Speculative RAG", "Plain RAG", "Concept recall"], language_rows)]
+    cross_rows = []
+    for flag, label in ((False, "Same language (question = document)"),
+                        (True, "Cross-language (question != document)")):
+        group = [r for r in ok if bool(r.get("cross_language")) == flag]
+        if group and any(r.get("cross_language") for r in ok):
+            cross_rows.append([
+                f"{label} ({len(group)})",
+                pct(summary_row(group)["accuracy"]),
+                pct(mean(r["baseline"]["correct"] for r in group)),
+                pct(summary_row(group)["concept_recall"]),
+            ])
+    if cross_rows:
+        out += ["", "## 2b. Same-language vs cross-language", "",
+                md_table(["Setting", "Speculative RAG", "Plain RAG", "Concept recall"], cross_rows)]
     out += retrieval_section(ok, 2)
 
     usage_rows = [r.get("llm_usage", {}) for r in ok if r.get("llm_usage")]
