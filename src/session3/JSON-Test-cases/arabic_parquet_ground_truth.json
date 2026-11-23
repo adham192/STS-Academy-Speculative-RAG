@@ -7,9 +7,16 @@
     "source": "book_1038-train-00000-of-00001.parquet",
     "ground_truth": "تحفة الأولاد في توحيد رب العباد",
     "required_concepts": [
-      ["تحفة الأولاد"],
-      ["توحيد رب العباد"]
-    ]
+      [
+        "تحفة الأولاد"
+      ],
+      [
+        "توحيد رب العباد"
+      ]
+    ],
+    "question_language": "ar",
+    "doc_language": "ar",
+    "cross_language": false
   },
   {
     "id": "AR02",
@@ -19,8 +26,14 @@
     "source": "book_1038-train-00000-of-00001.parquet",
     "ground_truth": "محمد بن عيد الشعباني",
     "required_concepts": [
-      ["محمد بن عيد الشعباني", "محمد بن عيد بن محمود بن شعبان"]
-    ]
+      [
+        "محمد بن عيد الشعباني",
+        "محمد بن عيد بن محمود بن شعبان"
+      ]
+    ],
+    "question_language": "ar",
+    "doc_language": "ar",
+    "cross_language": false
   },
   {
     "id": "AR03",
@@ -30,9 +43,16 @@
     "source": "book_1038-train-00000-of-00001.parquet",
     "ground_truth": "قرية من قرى الريف المصري التابعة لمدينة بنها بمحافظة القليوبية",
     "required_concepts": [
-      ["قرية من قرى الريف المصري"],
-      ["بنها بمحافظة القليوبية"]
-    ]
+      [
+        "قرية من قرى الريف المصري"
+      ],
+      [
+        "بنها بمحافظة القليوبية"
+      ]
+    ],
+    "question_language": "ar",
+    "doc_language": "ar",
+    "cross_language": false
   },
   {
     "id": "AR04",
@@ -42,8 +62,13 @@
     "source": "book_1038-train-00000-of-00001.parquet",
     "ground_truth": "المعروف بـ محمد بن عيد الشعباني",
     "required_concepts": [
-      ["محمد بن عيد الشعباني"]
-    ]
+      [
+        "محمد بن عيد الشعباني"
+      ]
+    ],
+    "question_language": "ar",
+    "doc_language": "ar",
+    "cross_language": false
   },
   {
     "id": "AR05",
@@ -53,10 +78,19 @@
     "source": "book_1038-train-00000-of-00001.parquet",
     "ground_truth": "معرفة الله بإلهيته وربوبيته وأسمائه وصفاته وتوحيده",
     "required_concepts": [
-      ["معرفة الله"],
-      ["إلهيته وربوبيته"],
-      ["أسمائه وصفاته"]
-    ]
+      [
+        "معرفة الله"
+      ],
+      [
+        "إلهيته وربوبيته"
+      ],
+      [
+        "أسمائه وصفاته"
+      ]
+    ],
+    "question_language": "ar",
+    "doc_language": "ar",
+    "cross_language": false
   },
   {
     "id": "AR06",
@@ -66,8 +100,13 @@
     "source": "book_1038-train-00000-of-00001.parquet",
     "ground_truth": "الشيخ أحمد حامد آل طعيمة",
     "required_concepts": [
-      ["أحمد حامد آل طعيمة"]
-    ]
+      [
+        "أحمد حامد آل طعيمة"
+      ]
+    ],
+    "question_language": "ar",
+    "doc_language": "ar",
+    "cross_language": false
   },
   {
     "id": "AR07",
@@ -77,8 +116,13 @@
     "source": "book_1038-train-00000-of-00001.parquet",
     "ground_truth": "الخميس ٢١ صفر ١٤٣٤",
     "required_concepts": [
-      ["٢١ صفر ١٤٣٤"]
-    ]
+      [
+        "٢١ صفر ١٤٣٤"
+      ]
+    ],
+    "question_language": "ar",
+    "doc_language": "ar",
+    "cross_language": false
   },
   {
     "id": "AR08",
@@ -88,7 +132,351 @@
     "source": "book_1038-train-00000-of-00001.parquet",
     "ground_truth": "أبو حمزة غازي بن سالم أفلح",
     "required_concepts": [
-      ["أبو حمزة غازي بن سالم أفلح"]
+      [
+        "أبو حمزة غازي بن سالم أفلح"
+      ]
+    ],
+    "question_language": "ar",
+    "doc_language": "ar",
+    "cross_language": false
+  },
+  {
+    "id": "AR01-EN",
+    "level": "easy",
+    "topic": "Book title",
+    "question": "What is the title of the book this text is about?",
+    "ground_truth": "Tuhfat al-Awlad fi Tawhid Rabb al-'Ibad (The Children's Gift on the Oneness of the Lord of the Servants)",
+    "source": "book_1038-train-00000-of-00001.parquet",
+    "question_language": "en",
+    "doc_language": "ar",
+    "cross_language": true,
+    "cross_language_of": "AR01",
+    "required_concepts": [
+      [
+        "Tuhfat al-Awlad",
+        "Tuhfat al Awlad",
+        "Tuhfah al-Awlad",
+        "Tohfat al-Awlad",
+        "Tuhfat ul-Awlad",
+        "Tuhfat al-Awlaad",
+        "Gift of the Children",
+        "Gift for the Children",
+        "Children's Gift",
+        "Gift of the Boys"
+      ],
+      [
+        "Tawhid Rabb al-Ibad",
+        "Tawheed Rabb al-Ibad",
+        "Tawhid of the Lord of the Servants",
+        "Oneness of the Lord of the Servants",
+        "Monotheism of the Lord of the Servants",
+        "Oneness of the Lord of Worshippers",
+        "Oneness of the Lord of the Worshippers",
+        "Tawhid Rabb al-'Ibad",
+        "Unity of the Lord of the Servants",
+        "Oneness of the Lord of Mankind"
+      ]
+    ],
+    "evidence_concepts": [
+      [
+        "تحفة الأولاد"
+      ],
+      [
+        "توحيد رب العباد"
+      ]
+    ]
+  },
+  {
+    "id": "AR02-EN",
+    "level": "easy",
+    "topic": "Author name",
+    "question": "What is the name of the poet (the nazim) mentioned in the biography of the nazim?",
+    "ground_truth": "Muhammad ibn Eid al-Shaabani",
+    "source": "book_1038-train-00000-of-00001.parquet",
+    "question_language": "en",
+    "doc_language": "ar",
+    "cross_language": true,
+    "cross_language_of": "AR02",
+    "required_concepts": [
+      [
+        "Muhammad",
+        "Mohammed",
+        "Mohamed",
+        "Muhammed"
+      ],
+      [
+        "Eid",
+        "Id",
+        "Eed"
+      ],
+      [
+        "Shaabani",
+        "Sha'bani",
+        "Shabani",
+        "Shaabany",
+        "Sha'abani",
+        "Shaaban"
+      ]
+    ],
+    "evidence_concepts": [
+      [
+        "محمد بن عيد الشعباني",
+        "محمد بن عيد بن محمود بن شعبان"
+      ]
+    ]
+  },
+  {
+    "id": "AR03-EN",
+    "level": "medium",
+    "topic": "Place of birth",
+    "question": "In which village was the nazim born?",
+    "ground_truth": "A village in the Egyptian countryside belonging to the city of Banha in Qalyubia Governorate",
+    "source": "book_1038-train-00000-of-00001.parquet",
+    "question_language": "en",
+    "doc_language": "ar",
+    "cross_language": true,
+    "cross_language_of": "AR03",
+    "required_concepts": [
+      [
+        "Egyptian countryside",
+        "Egyptian rural",
+        "countryside of Egypt",
+        "rural Egypt",
+        "Egyptian village",
+        "villages of Egypt"
+      ],
+      [
+        "Banha",
+        "Benha",
+        "Banhā"
+      ],
+      [
+        "Qalyubia",
+        "Qalyubiyya",
+        "Qalyubiyah",
+        "Qaliubiya",
+        "Qalyoubia",
+        "Qalubia",
+        "Qalioubia",
+        "Kalyubia",
+        "Qalyubiya"
+      ]
+    ],
+    "evidence_concepts": [
+      [
+        "قرية من قرى الريف المصري"
+      ],
+      [
+        "بنها بمحافظة القليوبية"
+      ]
+    ]
+  },
+  {
+    "id": "AR04-EN",
+    "level": "medium",
+    "topic": "Name and lineage",
+    "question": "By what well-known name, including his attributed lineage, is the nazim known?",
+    "ground_truth": "Muhammad ibn Eid al-Shaabani",
+    "source": "book_1038-train-00000-of-00001.parquet",
+    "question_language": "en",
+    "doc_language": "ar",
+    "cross_language": true,
+    "cross_language_of": "AR04",
+    "required_concepts": [
+      [
+        "Muhammad",
+        "Mohammed",
+        "Mohamed",
+        "Muhammed"
+      ],
+      [
+        "Eid",
+        "Id",
+        "Eed"
+      ],
+      [
+        "Shaabani",
+        "Sha'bani",
+        "Shabani",
+        "Shaabany",
+        "Sha'abani",
+        "Shaaban"
+      ]
+    ],
+    "evidence_concepts": [
+      [
+        "محمد بن عيد الشعباني"
+      ]
+    ]
+  },
+  {
+    "id": "AR05-EN",
+    "level": "hard",
+    "topic": "Tawhid",
+    "question": "According to the introduction of the text, what is the first obligation upon servants?",
+    "ground_truth": "Knowing God in His divinity, lordship, names, attributes and oneness",
+    "source": "book_1038-train-00000-of-00001.parquet",
+    "question_language": "en",
+    "doc_language": "ar",
+    "cross_language": true,
+    "cross_language_of": "AR05",
+    "required_concepts": [
+      [
+        "knowing God",
+        "knowledge of God",
+        "know God",
+        "knowing Allah",
+        "knowledge of Allah",
+        "know Allah",
+        "to know God",
+        "to know Allah"
+      ],
+      [
+        "divinity",
+        "uluhiyya",
+        "uluhiyyah",
+        "uluhiyah",
+        "godhood",
+        "Godship"
+      ],
+      [
+        "lordship",
+        "rububiyya",
+        "rububiyyah",
+        "rububiyah",
+        "sovereignty"
+      ],
+      [
+        "names and attributes",
+        "names and qualities",
+        "names, attributes",
+        "names and characteristics",
+        "Asma and Sifat",
+        "names and His attributes",
+        "names and his attributes"
+      ]
+    ],
+    "evidence_concepts": [
+      [
+        "معرفة الله"
+      ],
+      [
+        "إلهيته وربوبيته"
+      ],
+      [
+        "أسمائه وصفاته"
+      ]
+    ]
+  },
+  {
+    "id": "AR06-EN",
+    "level": "medium",
+    "topic": "Teachers",
+    "question": "Who was the sheikh with whom the nazim completed a full recitation of the Quran in the narration of Hafs?",
+    "ground_truth": "Sheikh Ahmad Hamid Al Tuaima",
+    "source": "book_1038-train-00000-of-00001.parquet",
+    "question_language": "en",
+    "doc_language": "ar",
+    "cross_language": true,
+    "cross_language_of": "AR06",
+    "required_concepts": [
+      [
+        "Ahmad",
+        "Ahmed",
+        "Ahmat"
+      ],
+      [
+        "Hamid",
+        "Hamed"
+      ],
+      [
+        "Tuaima",
+        "Tu'aima",
+        "Tuayma",
+        "Tu'ayma",
+        "Tuaymah",
+        "Tuaimah",
+        "Taima",
+        "Toaima",
+        "Tuaiema",
+        "Taeema",
+        "Tuaymeh"
+      ]
+    ],
+    "evidence_concepts": [
+      [
+        "أحمد حامد آل طعيمة"
+      ]
+    ]
+  },
+  {
+    "id": "AR07-EN",
+    "level": "medium",
+    "topic": "Date",
+    "question": "What Hijri date is mentioned at the end of Abu Hamza's message?",
+    "ground_truth": "Thursday, 21 Safar 1434 AH",
+    "source": "book_1038-train-00000-of-00001.parquet",
+    "question_language": "en",
+    "doc_language": "ar",
+    "cross_language": true,
+    "cross_language_of": "AR07",
+    "required_concepts": [
+      [
+        "21 Safar 1434",
+        "Safar 21, 1434",
+        "21st of Safar 1434",
+        "21st Safar 1434",
+        "21 Safar, 1434",
+        "21st of Safar, 1434",
+        "Safar 21 1434",
+        "٢١ صفر ١٤٣٤"
+      ]
+    ],
+    "evidence_concepts": [
+      [
+        "٢١ صفر ١٤٣٤"
+      ]
+    ]
+  },
+  {
+    "id": "AR08-EN",
+    "level": "medium",
+    "topic": "Author of the commentary",
+    "question": "Who wrote the commentary (hashiya) on the poem?",
+    "ground_truth": "Abu Hamza Ghazi ibn Salim Aflah",
+    "source": "book_1038-train-00000-of-00001.parquet",
+    "question_language": "en",
+    "doc_language": "ar",
+    "cross_language": true,
+    "cross_language_of": "AR08",
+    "required_concepts": [
+      [
+        "Abu Hamza",
+        "Abu Hamzah",
+        "Abo Hamza",
+        "Aba Hamza"
+      ],
+      [
+        "Ghazi",
+        "Ghazy",
+        "Ghaazi"
+      ],
+      [
+        "Salim",
+        "Salem",
+        "Saleem"
+      ],
+      [
+        "Aflah",
+        "Aflih",
+        "Aflaḥ",
+        "Afleh"
+      ]
+    ],
+    "evidence_concepts": [
+      [
+        "أبو حمزة غازي بن سالم أفلح"
+      ]
     ]
   }
 ]

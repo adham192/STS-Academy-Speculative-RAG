@@ -17,7 +17,10 @@
       [
         "judicial"
       ]
-    ]
+    ],
+    "question_language": "en",
+    "doc_language": "en",
+    "cross_language": false
   },
   {
     "id": "E02",
@@ -34,7 +37,10 @@
       [
         "House of Representatives"
       ]
-    ]
+    ],
+    "question_language": "en",
+    "doc_language": "en",
+    "cross_language": false
   },
   {
     "id": "E03",
@@ -54,7 +60,10 @@
         "state where they reside",
         "citizens of the state where they live"
       ]
-    ]
+    ],
+    "question_language": "en",
+    "doc_language": "en",
+    "cross_language": false
   },
   {
     "id": "E04",
@@ -68,7 +77,10 @@
       [
         "Necessary and Proper Clause"
       ]
-    ]
+    ],
+    "question_language": "en",
+    "doc_language": "en",
+    "cross_language": false
   },
   {
     "id": "M01",
@@ -89,7 +101,10 @@
         "not indispensable",
         "rather than indispensable"
       ]
-    ]
+    ],
+    "question_language": "en",
+    "doc_language": "en",
+    "cross_language": false
   },
   {
     "id": "M02",
@@ -111,7 +126,10 @@
         "substantially affect interstate commerce",
         "substantial relation to interstate commerce"
       ]
-    ]
+    ],
+    "question_language": "en",
+    "doc_language": "en",
+    "cross_language": false
   },
   {
     "id": "M03",
@@ -129,7 +147,10 @@
       [
         "people"
       ]
-    ]
+    ],
+    "question_language": "en",
+    "doc_language": "en",
+    "cross_language": false
   },
   {
     "id": "M04",
@@ -146,7 +167,10 @@
       [
         "arbitrary exercise of government power"
       ]
-    ]
+    ],
+    "question_language": "en",
+    "doc_language": "en",
+    "cross_language": false
   },
   {
     "id": "H01",
@@ -176,7 +200,10 @@
       [
         "letter and spirit of the Constitution"
       ]
-    ]
+    ],
+    "question_language": "en",
+    "doc_language": "en",
+    "cross_language": false
   },
   {
     "id": "H02",
@@ -199,7 +226,10 @@
         "connected to interstate commerce",
         "connection to interstate commerce"
       ]
-    ]
+    ],
+    "question_language": "en",
+    "doc_language": "en",
+    "cross_language": false
   },
   {
     "id": "H03",
@@ -219,14 +249,17 @@
       [
         "treated the same as other state citizens",
         "same as other citizens of the state",
-        "full citizens of the state immediately", 
-        "treated the same as other", 
-        "treated like other citizens", 
-        "treated like other", 
-        "same as other state citizens", 
+        "full citizens of the state immediately",
+        "treated the same as other",
+        "treated like other citizens",
+        "treated like other",
+        "same as other state citizens",
         "like other citizens of that state"
       ]
-    ]
+    ],
+    "question_language": "en",
+    "doc_language": "en",
+    "cross_language": false
   },
   {
     "id": "H04",
@@ -237,6 +270,700 @@
     "source": "large_pdf.pdf",
     "difficulty_rationale": "Requires comparing two appointment rules and retaining the constitutionally permitted appointing authorities.",
     "required_concepts": [
+      [
+        "principal officers"
+      ],
+      [
+        "President"
+      ],
+      [
+        "advice and consent of the Senate"
+      ],
+      [
+        "inferior officers"
+      ],
+      [
+        "President alone"
+      ],
+      [
+        "courts of law"
+      ],
+      [
+        "heads of departments"
+      ]
+    ],
+    "question_language": "en",
+    "doc_language": "en",
+    "cross_language": false
+  },
+  {
+    "id": "E01-AR",
+    "level": "easy",
+    "topic": "Structure of government",
+    "question": "ما السلطات الحكومية العامة الثلاث التي يوزعها الدستور على الفروع الثلاثة للحكومة الفيدرالية؟",
+    "ground_truth": "السلطة التشريعية والسلطة التنفيذية والسلطة القضائية",
+    "source": "large_pdf.pdf",
+    "difficulty_rationale": "Direct identification of a foundational constitutional structure.",
+    "question_language": "ar",
+    "doc_language": "en",
+    "cross_language": true,
+    "cross_language_of": "E01",
+    "required_concepts": [
+      [
+        "تشريعي",
+        "التشريع"
+      ],
+      [
+        "تنفيذي"
+      ],
+      [
+        "قضائي"
+      ]
+    ],
+    "evidence_concepts": [
+      [
+        "legislative"
+      ],
+      [
+        "executive"
+      ],
+      [
+        "judicial"
+      ]
+    ]
+  },
+  {
+    "id": "E02-AR",
+    "level": "easy",
+    "topic": "Article I",
+    "question": "ما المجلسان اللذان يتكوّن منهما الكونغرس الأمريكي بموجب المادة الأولى؟",
+    "ground_truth": "مجلس الشيوخ ومجلس النواب",
+    "source": "large_pdf.pdf",
+    "difficulty_rationale": "Direct factual retrieval from Article I, Section 1.",
+    "question_language": "ar",
+    "doc_language": "en",
+    "cross_language": true,
+    "cross_language_of": "E02",
+    "required_concepts": [
+      [
+        "مجلس الشيوخ"
+      ],
+      [
+        "مجلس النواب"
+      ]
+    ],
+    "evidence_concepts": [
+      [
+        "Senate"
+      ],
+      [
+        "House of Representatives"
+      ]
+    ]
+  },
+  {
+    "id": "E03-AR",
+    "level": "easy",
+    "topic": "Fourteenth Amendment",
+    "question": "بموجب القسم الأول من التعديل الرابع عشر، ماذا تقرر الجملة الأولى بشأن الأشخاص المولودين أو المتجنسين في الولايات المتحدة والخاضعين لسلطتها القضائية؟",
+    "ground_truth": "أنهم مواطنون للولايات المتحدة وللولاية التي يقيمون فيها",
+    "source": "large_pdf.pdf",
+    "difficulty_rationale": "Requires locating and restating one explicit constitutional guarantee.",
+    "question_language": "ar",
+    "doc_language": "en",
+    "cross_language": true,
+    "cross_language_of": "E03",
+    "required_concepts": [
+      [
+        "مواطنو الولايات المتحدة",
+        "مواطني الولايات المتحدة",
+        "مواطنين للولايات المتحدة",
+        "مواطنون للولايات المتحدة",
+        "مواطنين أمريكيين",
+        "مواطنون أمريكيون",
+        "مواطنا للولايات المتحدة",
+        "مواطنين في الولايات المتحدة",
+        "مواطنو الولايات المتحدة الأمريكية",
+        "مواطني الولايات المتحدة الأمريكية",
+        "مواطنين للولايات المتحدة الأمريكية",
+        "مواطنون للولايات المتحدة الأمريكية"
+      ],
+      [
+        "الولاية التي يقيمون فيها",
+        "الولاية التي يسكنون فيها",
+        "الولاية التي يعيشون فيها",
+        "الولاية التي يقيم فيها",
+        "الولاية التي يقطنون فيها",
+        "ولاية إقامتهم",
+        "ولاية الإقامة",
+        "ولاية إقامته",
+        "الولاية التي يقطنونها",
+        "الولاية التي يقيمون بها",
+        "الولاية التي يقيم بها",
+        "للولاية التي يقيمون فيها",
+        "للولاية التي يقيم فيها",
+        "للولاية التي يقطنون فيها",
+        "للولاية التي يسكنون فيها",
+        "للولاية التي يعيشون فيها",
+        "للولاية التي يقيمون بها"
+      ]
+    ],
+    "evidence_concepts": [
+      [
+        "citizens of the United States",
+        "United States citizens"
+      ],
+      [
+        "State wherein they reside",
+        "state where they reside",
+        "citizens of the state where they live"
+      ]
+    ]
+  },
+  {
+    "id": "E04-AR",
+    "level": "easy",
+    "topic": "Article I, Necessary and Proper Clause",
+    "question": "ما اسم البند في المادة الأولى، القسم 8، الذي يخوّل الكونغرس سنّ القوانين اللازمة لتنفيذ سلطاته المحددة؟",
+    "ground_truth": "بند الضرورة والملاءمة",
+    "source": "large_pdf.pdf",
+    "difficulty_rationale": "Direct identification of a named constitutional clause.",
+    "question_language": "ar",
+    "doc_language": "en",
+    "cross_language": true,
+    "cross_language_of": "E04",
+    "required_concepts": [
+      [
+        "الضرورة والملاءمة",
+        "الضرورة والمناسبة",
+        "الضروري والملائم",
+        "الضروري والمناسب",
+        "الضرورة والملائمة",
+        "الضرورة واللياقة",
+        "الضرورة والاستصواب",
+        "اللازم والمناسب",
+        "الضروري واللائق"
+      ]
+    ],
+    "evidence_concepts": [
+      [
+        "Necessary and Proper Clause"
+      ]
+    ]
+  },
+  {
+    "id": "M01-AR",
+    "level": "medium",
+    "topic": "McCulloch v. Maryland",
+    "question": "في قضية ماكولوتش ضد ماريلاند، هل فسّرت المحكمة العليا كلمة «ضروري» في بند الضرورة والملاءمة بمعنى ما لا غنى عنه إطلاقًا؟ وما التفسير الذي تبنّته بدلًا من ذلك؟",
+    "ground_truth": "ليس بمعنى ما لا غنى عنه إطلاقًا، بل بمعنى مؤدٍّ إلى الغاية أو لازم ونافع",
+    "source": "large_pdf.pdf",
+    "difficulty_rationale": "Requires distinguishing the Court's adopted interpretation from a rejected narrow interpretation.",
+    "question_language": "ar",
+    "doc_language": "en",
+    "cross_language": true,
+    "cross_language_of": "M01",
+    "required_concepts": [
+      [
+        "مؤد",
+        "مفض",
+        "مساعد",
+        "ميسر",
+        "مفيد",
+        "نافع",
+        "لازم",
+        "ملائم",
+        "مناسب",
+        "يؤدي",
+        "يفضي",
+        "يخدم",
+        "مفيدا",
+        "تسهم",
+        "يسهم",
+        "يساعد"
+      ],
+      [
+        "ليس ضروريا على نحو مطلق",
+        "ليست ضرورية بشكل مطلق",
+        "لا غنى عنه",
+        "التفسير الضيق",
+        "بالمعنى المطلق",
+        "على نحو مطلق",
+        "بشكل مطلق",
+        "بصورة مطلقة",
+        "مطلقا",
+        "ليس بالضرورة",
+        "ليست ضرورية بالمعنى",
+        "لا تعني"
+      ]
+    ],
+    "evidence_concepts": [
+      [
+        "conducive to",
+        "needful"
+      ],
+      [
+        "rejected a narrow interpretation",
+        "not absolutely indispensable",
+        "not indispensable",
+        "rather than indispensable"
+      ]
+    ]
+  },
+  {
+    "id": "M02-AR",
+    "level": "medium",
+    "topic": "Commerce Clause",
+    "question": "ما الفئات الثلاث العامة من الأنشطة التي يجوز للكونغرس تنظيمها بموجب سلطته في بند التجارة؟",
+    "ground_truth": "قنوات التجارة بين الولايات؛ وأدوات التجارة بين الولايات أو الأشخاص أو الأشياء فيها؛ والأنشطة التي تؤثر تأثيرًا كبيرًا على التجارة بين الولايات",
+    "source": "large_pdf.pdf",
+    "difficulty_rationale": "Requires retrieving and combining three related categories rather than one isolated fact.",
+    "question_language": "ar",
+    "doc_language": "en",
+    "cross_language": true,
+    "cross_language_of": "M02",
+    "required_concepts": [
+      [
+        "قنوات التجارة"
+      ],
+      [
+        "أدوات التجارة",
+        "وسائل التجارة",
+        "الأشخاص أو الأشياء",
+        "الأشخاص والأشياء"
+      ],
+      [
+        "تؤثر تأثيرا كبيرا",
+        "تؤثر بشكل كبير",
+        "تؤثر بصورة كبيرة",
+        "تأثير كبير",
+        "تأثيرا جوهريا",
+        "تؤثر تأثيرا جوهريا",
+        "تؤثر بشكل جوهري",
+        "تأثير جوهري",
+        "تؤثر بدرجة كبيرة",
+        "تؤثر بشكل ملموس",
+        "علاقة جوهرية",
+        "علاقة كبيرة",
+        "تؤثر بصورة جوهرية",
+        "تأثيرا ملموسا",
+        "تأثير ملموس",
+        "تأثيرا كبيرا",
+        "تؤثر بشكل جوهري"
+      ]
+    ],
+    "evidence_concepts": [
+      [
+        "channels of interstate commerce"
+      ],
+      [
+        "instrumentalities of interstate commerce",
+        "persons or things in interstate commerce"
+      ],
+      [
+        "substantially affect interstate commerce",
+        "substantial relation to interstate commerce"
+      ]
+    ]
+  },
+  {
+    "id": "M03-AR",
+    "level": "medium",
+    "topic": "Tenth Amendment",
+    "question": "وفقًا للتعديل العاشر، إلى أين تؤول السلطات التي لم يفوّضها الدستور للولايات المتحدة ولم يحظرها على الولايات؟",
+    "ground_truth": "محفوظة للولايات كلٌّ على حدة، أو للشعب",
+    "source": "large_pdf.pdf",
+    "difficulty_rationale": "Requires identifying the constitutional allocation rule and its two recipients.",
+    "question_language": "ar",
+    "doc_language": "en",
+    "cross_language": true,
+    "cross_language_of": "M03",
+    "required_concepts": [
+      [
+        "للولايات",
+        "الولايات"
+      ],
+      [
+        "للشعب",
+        "الشعب"
+      ]
+    ],
+    "evidence_concepts": [
+      [
+        "States respectively",
+        "States"
+      ],
+      [
+        "people"
+      ]
+    ]
+  },
+  {
+    "id": "M04-AR",
+    "level": "medium",
+    "topic": "Fourteenth Amendment, procedural due process",
+    "question": "عندما تكون هناك مصلحة محمية على المحك، ما الضمانات الإجرائية العامة التي يتطلبها بند الإجراءات القانونية الواجبة في التعديل الرابع عشر، وفقًا للنظرة العامة في «دستور الولايات المتحدة المشروح»؟",
+    "ground_truth": "يجب أن تكون الإجراءات عادلة ومنصفة بحيث لا يتعرض الأفراد للممارسة التعسفية لسلطة الحكومة",
+    "source": "large_pdf.pdf",
+    "difficulty_rationale": "Requires summarizing a general rule rather than copying a clause name.",
+    "question_language": "ar",
+    "doc_language": "en",
+    "cross_language": true,
+    "cross_language_of": "M04",
+    "required_concepts": [
+      [
+        "عادل",
+        "منصف",
+        "نزيه",
+        "متكافئ",
+        "محايد",
+        "متوازن",
+        "متساو"
+      ],
+      [
+        "تعسف"
+      ]
+    ],
+    "evidence_concepts": [
+      [
+        "evenhanded"
+      ],
+      [
+        "arbitrary exercise of government power"
+      ]
+    ]
+  },
+  {
+    "id": "H01-AR",
+    "level": "hard",
+    "topic": "McCulloch v. Maryland, constitutional test",
+    "question": "اذكر الاختبار الذي أرسته قضية ماكولوتش ضد ماريلاند لتحديد ما إذا كان يجوز للكونغرس استخدام وسيلة ضمنية لتنفيذ سلطة دستورية، مع بيان الشروط المتعلقة بالغاية وبالوسيلة.",
+    "ground_truth": "يجب أن تكون الغاية مشروعة وضمن نطاق الدستور، وأن تكون الوسيلة ملائمة ومكيّفة بوضوح لتلك الغاية وغير محظورة ومتفقة مع نص الدستور وروحه",
+    "source": "large_pdf.pdf",
+    "difficulty_rationale": "Requires synthesizing multiple linked requirements from the Court's reasoning.",
+    "question_language": "ar",
+    "doc_language": "en",
+    "cross_language": true,
+    "cross_language_of": "H01",
+    "required_concepts": [
+      [
+        "مشروع",
+        "شرعي"
+      ],
+      [
+        "نطاق الدستور",
+        "حدود الدستور",
+        "نطاق صلاحيات الدستور",
+        "نطاق السلطات الدستورية"
+      ],
+      [
+        "ملائم",
+        "مناسب",
+        "ملائمة",
+        "مناسبة"
+      ],
+      [
+        "بوضوح",
+        "بجلاء",
+        "بشكل واضح",
+        "بصورة واضحة",
+        "بشكل جلي",
+        "بصورة جلية"
+      ],
+      [
+        "غير محظور",
+        "لا يحظرها",
+        "غير ممنوع",
+        "ألا تكون محظورة",
+        "ألا تكون محظورا",
+        "لا تكون محظورة",
+        "لا يحظره",
+        "غير محرمة",
+        "غير مخالف"
+      ],
+      [
+        "نص الدستور وروحه",
+        "نصه وروحه",
+        "حرفية الدستور وروحه",
+        "منطوق الدستور وروحه",
+        "نص وروح الدستور",
+        "روح الدستور ونصه",
+        "روح ونص الدستور",
+        "روحه ونصه",
+        "نصوص الدستور وروحه",
+        "حرف الدستور وروحه"
+      ]
+    ],
+    "evidence_concepts": [
+      [
+        "legitimate"
+      ],
+      [
+        "within the scope of the Constitution",
+        "within the Constitution's scope"
+      ],
+      [
+        "appropriate"
+      ],
+      [
+        "plainly adapted"
+      ],
+      [
+        "not prohibited"
+      ],
+      [
+        "letter and spirit of the Constitution"
+      ]
+    ]
+  },
+  {
+    "id": "H02-AR",
+    "level": "hard",
+    "topic": "United States v. Lopez, Commerce Clause limits",
+    "question": "يجرّم قانون اتحادي حيازة سلاح ناري بالقرب من مدرسة دون أن يربط الجريمة بالتجارة بين الولايات. وفقًا لمنطق بند التجارة الوارد في «دستور الولايات المتحدة المشروح»، لماذا قد يتجاوز هذا القانون سلطة الكونغرس في تنظيم التجارة؟",
+    "ground_truth": "لأن حيازة سلاح ناري في منطقة مدرسية نشاط غير اقتصادي لا يؤثر تأثيرًا كبيرًا على التجارة بين الولايات",
+    "source": "large_pdf.pdf",
+    "difficulty_rationale": "Applies the Commerce Clause categories to a concrete legal scenario and identifies the federalism limit.",
+    "question_language": "ar",
+    "doc_language": "en",
+    "cross_language": true,
+    "cross_language_of": "H02",
+    "required_concepts": [
+      [
+        "غير اقتصادي",
+        "غير تجاري",
+        "ليس نشاطا اقتصاديا",
+        "ليس نشاطا تجاريا",
+        "ليست نشاطا اقتصاديا",
+        "ليست نشاطا تجاريا",
+        "لا يعد نشاطا اقتصاديا",
+        "لا يعد نشاطا تجاريا",
+        "لا تعد نشاطا اقتصاديا",
+        "لا تعد نشاطا تجاريا",
+        "لا تنظم نشاطا اقتصاديا",
+        "لا تنظم نشاطا تجاريا",
+        "لا ينظم نشاطا اقتصاديا",
+        "لا ينظم نشاطا تجاريا",
+        "ليس اقتصاديا",
+        "ليس تجاريا",
+        "ليست اقتصادية",
+        "ليست تجارية",
+        "لا يتعلق بنشاط اقتصادي",
+        "لا يتعلق بنشاط تجاري"
+      ],
+      [
+        "تؤثر تأثيرا كبيرا",
+        "تؤثر بشكل كبير",
+        "تؤثر بصورة كبيرة",
+        "تأثير كبير",
+        "تأثير جوهري",
+        "تؤثر بشكل جوهري",
+        "تؤثر تأثيرا جوهريا",
+        "تؤثر بدرجة كبيرة",
+        "تأثيرا ملموسا",
+        "تأثير ملموس",
+        "تؤثر بشكل ملموس",
+        "تؤثر بصورة جوهرية",
+        "يؤثر تأثيرا كبيرا",
+        "يؤثر بشكل كبير",
+        "يؤثر بصورة كبيرة",
+        "يؤثر تأثيرا جوهريا",
+        "يؤثر بشكل جوهري",
+        "يؤثر بدرجة كبيرة",
+        "يؤثر بشكل ملموس",
+        "يؤثر تأثيرا ملموسا",
+        "يؤثر بصورة جوهرية",
+        "علاقة بالتجارة",
+        "صلة بالتجارة",
+        "ارتباط بالتجارة",
+        "ارتباطه بالتجارة",
+        "علاقتها بالتجارة",
+        "صلتها بالتجارة",
+        "صلته بالتجارة",
+        "علاقته بالتجارة",
+        "تربطها بالتجارة",
+        "يربطها بالتجارة",
+        "يرتبط بالتجارة",
+        "ترتبط بالتجارة",
+        "يتصل بالتجارة"
+      ]
+    ],
+    "evidence_concepts": [
+      [
+        "non-economic activity",
+        "noneconomic activity",
+        "not a commercial activity",
+        "does not regulate commercial activity"
+      ],
+      [
+        "substantially affect interstate commerce",
+        "substantial effect on interstate commerce",
+        "connected to interstate commerce",
+        "connection to interstate commerce"
+      ]
+    ]
+  },
+  {
+    "id": "H03-AR",
+    "level": "hard",
+    "topic": "Saenz v. Roe, Fourteenth Amendment",
+    "question": "في قضية ساينز ضد رو، كيف استخدمت المحكمة العليا بند الامتيازات أو الحصانات في التعديل الرابع عشر لحماية المواطنين الذين انتقلوا حديثًا إلى ولاية جديدة؟",
+    "ground_truth": "حق المواطنين الوافدين حديثًا في أن يُعاملوا معاملة غيرهم من مواطني الولاية",
+    "source": "large_pdf.pdf",
+    "difficulty_rationale": "Requires connecting a named Supreme Court decision to a specific constitutional clause and the right it protects.",
+    "question_language": "ar",
+    "doc_language": "en",
+    "cross_language": true,
+    "cross_language_of": "H03",
+    "required_concepts": [
+      [
+        "الوافدين حديثا",
+        "الوافدين الجدد",
+        "الذين انتقلوا حديثا",
+        "المنتقلين حديثا",
+        "القادمين حديثا",
+        "القادمين الجدد",
+        "المقيمين الجدد",
+        "المواطنين الجدد",
+        "الوافدون حديثا",
+        "الوافدون الجدد",
+        "القادمون حديثا",
+        "المنتقلون حديثا",
+        "الذين وصلوا حديثا",
+        "حديثي الانتقال",
+        "حديثي الوصول",
+        "حديثي الإقامة",
+        "الذين انتقلوا إلى ولاية جديدة",
+        "الذين ينتقلون إلى ولاية جديدة"
+      ],
+      [
+        "يعاملوا بالمساواة",
+        "يعاملوا على قدم المساواة",
+        "يعاملوا مثل",
+        "يعاملوا كغيرهم",
+        "معاملة مساوية",
+        "معاملتهم بالمساواة",
+        "معاملتهم مثل",
+        "معاملتهم كغيرهم",
+        "مثل غيرهم من مواطني الولاية",
+        "مثل مواطني الولاية",
+        "مثل باقي مواطني الولاية",
+        "مثل سائر مواطني الولاية",
+        "كسائر مواطني الولاية",
+        "كغيرهم من مواطني الولاية",
+        "كباقي مواطني الولاية",
+        "نفس معاملة",
+        "نفس الحقوق",
+        "بالمساواة مع",
+        "على قدم المساواة",
+        "قدم المساواة",
+        "المساواة مع مواطني الولاية",
+        "المساواة مع غيرهم",
+        "معاملة غيرهم",
+        "معاملة مواطني",
+        "معاملة باقي",
+        "معاملة سائر"
+      ]
+    ],
+    "evidence_concepts": [
+      [
+        "newly arrived citizens",
+        "newly arrived residents",
+        "recently moved citizens",
+        "recently moved residents"
+      ],
+      [
+        "treated the same as other state citizens",
+        "same as other citizens of the state",
+        "full citizens of the state immediately",
+        "treated the same as other",
+        "treated like other citizens",
+        "treated like other",
+        "same as other state citizens",
+        "like other citizens of that state"
+      ]
+    ]
+  },
+  {
+    "id": "H04-AR",
+    "level": "hard",
+    "topic": "Article II, Appointments Clause",
+    "question": "كيف يميّز بند التعيينات بين تعيين كبار الموظفين وتعيين الموظفين الأدنى مرتبة؟",
+    "ground_truth": "يُعيَّن كبار الموظفين بواسطة الرئيس بمشورة مجلس الشيوخ وموافقته، بينما يجوز للكونغرس بقانون أن يُسند تعيين الموظفين الأدنى إلى الرئيس وحده أو إلى المحاكم أو إلى رؤساء الإدارات",
+    "source": "large_pdf.pdf",
+    "difficulty_rationale": "Requires comparing two appointment rules and retaining the constitutionally permitted appointing authorities.",
+    "question_language": "ar",
+    "doc_language": "en",
+    "cross_language": true,
+    "cross_language_of": "H04",
+    "required_concepts": [
+      [
+        "كبار الموظفين",
+        "كبار المسؤولين",
+        "كبار الضباط",
+        "الموظفين الرئيسيين",
+        "المسؤولين الرئيسيين",
+        "الضباط الرئيسيين",
+        "كبار موظفي",
+        "الموظفين الرئيسين"
+      ],
+      [
+        "الرئيس"
+      ],
+      [
+        "مشورة مجلس الشيوخ وموافقته",
+        "مشورة وموافقة مجلس الشيوخ",
+        "موافقة مجلس الشيوخ ومشورته",
+        "مشورة ومصادقة مجلس الشيوخ",
+        "بمشورة مجلس الشيوخ",
+        "نصيحة وموافقة مجلس الشيوخ",
+        "موافقة مجلس الشيوخ",
+        "مصادقة مجلس الشيوخ",
+        "مشورة المجلس",
+        "مشورته وموافقته"
+      ],
+      [
+        "الموظفين الأدنى",
+        "الموظفين الأقل مرتبة",
+        "الموظفين التابعين",
+        "الموظفين الثانويين",
+        "المسؤولين الأدنى",
+        "المسؤولين الأقل",
+        "الضباط الأدنى",
+        "الموظفين الأدنى درجة",
+        "الموظفين الفرعيين",
+        "موظفين أدنى",
+        "موظفين أقل",
+        "الموظفين الأقل",
+        "الموظفين الأصغر",
+        "المسؤولين التابعين",
+        "الضباط التابعين"
+      ],
+      [
+        "الرئيس وحده",
+        "الرئيس فقط",
+        "للرئيس وحده",
+        "للرئيس فقط",
+        "إلى الرئيس وحده",
+        "إلى الرئيس فقط"
+      ],
+      [
+        "المحاكم",
+        "محاكم"
+      ],
+      [
+        "رؤساء الإدارات",
+        "رؤساء الدوائر",
+        "رؤساء الأقسام",
+        "رؤساء الوزارات",
+        "رؤساء الأجهزة",
+        "رؤساء الإدارات الحكومية",
+        "رؤساء الإدارات التنفيذية",
+        "رؤساء المصالح",
+        "رؤساء الدوائر الحكومية"
+      ]
+    ],
+    "evidence_concepts": [
       [
         "principal officers"
       ],
