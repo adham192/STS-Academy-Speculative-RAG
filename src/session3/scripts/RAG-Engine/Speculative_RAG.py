@@ -9,14 +9,17 @@ from concurrent.futures import ThreadPoolExecutor
 import time
 import threading
 from collections import Counter
+from functools import lru_cache
 
 import numpy as np
-import requests
+import openai
 import chromadb
 import pymupdf
 import pandas as pd
 from dotenv import load_dotenv
 from sklearn.cluster import KMeans
+from langchain_core.prompts import ChatPromptTemplate
+from langchain_openai import ChatOpenAI, OpenAIEmbeddings
 
 try:
     import tiktoken
@@ -87,7 +90,8 @@ if missing:
     logger.critical("Missing values in .env: %s", ", ".join(missing))
     raise RuntimeError(f"Missing values in .env: {', '.join(missing)}")
 
-OPENROUTER_CHAT_URL = "https://openrouter.ai/api/v1/chat/completions"
+OPENROUTER_BASE_URL = "https://openrouter.ai/api/v1"        # OpenAI-compatible endpoint used by LangChain
+OPENROUTER_CHAT_URL = f"{OPENROUTER_BASE_URL}/chat/completions"
 VERIFY_TIMEOUT = 4000  # seconds per verification request
 # No token limit is applied by default. Time is bounded instead: a draft that runs longer
 # than DRAFT_TIMEOUT is stuck (e.g. a reasoning loop), so it is cut off and retried
@@ -320,6 +324,24 @@ def split_text_to_chunks(text):
     return chunks
 
 
+@lru_cache(maxsize=1)
+def _embedder():
+    """LangChain embeddings client pointed at OpenRouter (shared by all threads).
+
+    check_embedding_ctx_length=False makes LangChain send the raw strings instead of
+    tiktoken token ids (which only OpenAI's own endpoint understands). max_retries=0
+    keeps the retry/backoff policy in get_embeddings, exactly as before.
+    """
+    return OpenAIEmbeddings(
+        model=EMBED_MODEL,
+        api_key=OPENROUTER_API_KEY,
+        base_url=OPENROUTER_BASE_URL,
+        check_embedding_ctx_length=False,
+        timeout=120,
+        max_retries=0,
+    )
+
+
 def get_embeddings(texts, purpose="embedding", token_tracker=None):
     """Embed texts through OpenRouter and log token usage plus USD cost.
 
@@ -341,16 +363,15 @@ def get_embeddings(texts, purpose="embedding", token_tracker=None):
         batch = texts[start:start + EMBED_BATCH_SIZE]
         for attempt in range(3):
             try:
-                response = requests.post(
-                    "https://openrouter.ai/api/v1/embeddings",
-                    headers={"Authorization": f"Bearer {OPENROUTER_API_KEY}"},
-                    json={"model": embed_model, "input": batch},
-                    timeout=120,
+                # LangChain's OpenAIEmbeddings owns the client/config; its underlying
+                # embeddings resource is used here so OpenRouter's reported usage and
+                # cost (which embed_documents() drops) are still available for the logs.
+                response = _embedder().client.create(
+                    input=batch, model=embed_model, encoding_format="float",
                 )
-                response.raise_for_status()
                 break
-            except (requests.RequestException, requests.HTTPError) as error:
-                status = getattr(getattr(error, "response", None), "status_code", None)
+            except openai.APIError as error:  # network, timeout and HTTP-status errors
+                status = getattr(error, "status_code", None)
                 if status in (401, 402, 403, 404):
                     hint = {401: "invalid API key", 402: "OpenRouter credit exhausted - add credit",
                             403: "access denied", 404: "embedding model not found"}[status]
@@ -365,7 +386,7 @@ def get_embeddings(texts, purpose="embedding", token_tracker=None):
                     error,
                 )
                 time.sleep(2 ** attempt)
-        body = response.json()
+        body = response.model_dump()
         data = sorted(body["data"], key=lambda item: item["index"])
         vectors.extend(item["embedding"] for item in data)
 
@@ -634,6 +655,7 @@ Output only the translated question, nothing else.
 Question: {question}
 
 Translation:"""
+CROSS_LINGUAL_TEMPLATE = ChatPromptTemplate.from_messages([("human", CROSS_LINGUAL_PROMPT)])
 
 
 def translate_question_for_retrieval(question, token_tracker=None):
@@ -645,7 +667,7 @@ def translate_question_for_retrieval(question, token_tracker=None):
     started = time.perf_counter()
     try:
         translated = _call_openrouter_text(
-            CROSS_LINGUAL_PROMPT.format(question=question), DRAFT_MODEL,
+            CROSS_LINGUAL_TEMPLATE, {"question": question}, DRAFT_MODEL,
             "query translation", token_tracker=token_tracker,
             reasoning={"enabled": False},
             timeout=SHORT_TASK_TIMEOUT, attempts=SHORT_TASK_ATTEMPTS,
@@ -989,78 +1011,102 @@ Return JSON with exactly two keys, in this order: "rationale" first, then "answe
   If the question is broad, cover every relevant item.
 If the documents do not contain the answer, say so in the answer.
 """
+DRAFT_TEMPLATE = ChatPromptTemplate.from_messages([("human", DRAFT_PROMPT)])
 
 
-def _call_openrouter_text(prompt, model, stage_label, token_tracker=None, json_mode=False,
+def _extra_body_json(json_mode, reasoning, max_tokens):
+    """OpenRouter-specific request fields, sent through ChatOpenAI's extra_body.
+
+    They go in the body untouched (instead of ChatOpenAI's own max_tokens / response_format
+    arguments) so the request OpenRouter receives is the same as before.
+    """
+    extra = {"usage": {"include": True}}       # ask OpenRouter to report the real cost
+    if max_tokens:
+        extra["max_tokens"] = max_tokens
+    if json_mode:
+        extra["response_format"] = {"type": "json_object"}
+    if reasoning:
+        extra["reasoning"] = reasoning
+    return json.dumps(extra, sort_keys=True)
+
+
+@lru_cache(maxsize=None)
+def _chat_model(model, temperature, timeout, extra_body_json):
+    """LangChain chat model for one OpenRouter configuration (cached, thread-safe to share)."""
+    return ChatOpenAI(
+        model=model,
+        api_key=OPENROUTER_CHAT_API_KEY,
+        base_url=OPENROUTER_BASE_URL,
+        temperature=temperature,
+        timeout=timeout,
+        max_retries=0,              # retries/backoff are handled in this module, as before
+        use_responses_api=False,    # OpenRouter speaks Chat Completions
+        extra_body=json.loads(extra_body_json),
+    )
+
+
+def _status_error(error):
+    """openai.APIStatusError -> VerifierHTTPError (status code, body text, Retry-After)."""
+    response = error.response
+    retry_after = response.headers.get("Retry-After")
+    return VerifierHTTPError(
+        error.status_code, response.text[:300],
+        float(retry_after) if retry_after and retry_after.replace(".", "", 1).isdigit() else None,
+    )
+
+
+def _body_error(error):
+    """HTTP 200 whose body holds an OpenRouter error object, or a body that cannot be used."""
+    detail = error.args[0] if error.args else None
+    if isinstance(detail, dict):
+        code = detail.get("code")
+        return VerifierHTTPError(code if isinstance(code, int) else None, str(detail.get("message"))[:300])
+    return ValueError(f"Unexpected OpenRouter response: {str(error)[:200]}")
+
+
+_BODY_ERRORS = (ValueError, TypeError, KeyError, IndexError, AttributeError)
+
+
+def _call_openrouter_text(template, variables, model, stage_label, token_tracker=None, json_mode=False,
                           reasoning=None, timeout=VERIFY_TIMEOUT, max_tokens=None,
                           temperature=0, attempts=3):
-    """Call an OpenRouter chat model and return its text response."""
-    payload = {
-        "model": model,
-        "messages": [{"role": "user", "content": prompt}],
-        "temperature": temperature,
-    }
-    if max_tokens:
-        payload["max_tokens"] = max_tokens
-    if json_mode:
-        payload["response_format"] = {"type": "json_object"}
-    payload["usage"] = {"include": True}
-    if reasoning:
-        payload["reasoning"] = reasoning
+    """Run a ChatPromptTemplate through an OpenRouter chat model (LangChain) and return its text."""
+    prompt_value = template.invoke(variables)
+    prompt = prompt_value.to_messages()[0].content   # rendered prompt, used for token estimates
+    llm = _chat_model(model, temperature, timeout, _extra_body_json(json_mode, reasoning, max_tokens))
 
-    response = None
+    ai_message = None
     started = time.perf_counter()
     for attempt in range(attempts):
         try:
-            response = requests.post(
-                OPENROUTER_CHAT_URL,
-                headers={
-                    "Authorization": f"Bearer {OPENROUTER_CHAT_API_KEY}",
-                    "Content-Type": "application/json",
-                },
-                json=payload,
-                timeout=timeout,
-            )
-        except requests.RequestException as error:
+            ai_message = llm.invoke(prompt_value)
+            break
+        except openai.APIConnectionError as error:   # network error or timeout
             if attempt == attempts - 1:
                 raise VerifierHTTPError(None, f"network error: {error}") from error
             time.sleep(2 ** attempt)
-            continue
-
-        if response.status_code == 200:
-            break
-        retry_after = response.headers.get("Retry-After")
-        api_error = VerifierHTTPError(
-            response.status_code, response.text[:300],
-            float(retry_after) if retry_after and retry_after.replace(".", "", 1).isdigit() else None,
-        )
-        if response.status_code in (401, 402, 403, 404) or attempt == attempts - 1:
-            raise api_error
-        time.sleep(api_error.retry_after + 1 if api_error.retry_after else 2 ** attempt)
+        except openai.APIStatusError as error:       # non-200 HTTP status
+            api_error = _status_error(error)
+            if api_error.status in (401, 402, 403, 404) or attempt == attempts - 1:
+                raise api_error from error
+            time.sleep(api_error.retry_after + 1 if api_error.retry_after else 2 ** attempt)
+        except _BODY_ERRORS as error:                # error object inside an HTTP 200 reply
+            raise _body_error(error) from error
 
     elapsed = time.perf_counter() - started
-    body = response.json()
-    if body.get("error"):
-        err = body["error"]
-        code = err.get("code") if isinstance(err, dict) else None
-        message = err.get("message") if isinstance(err, dict) else str(err)
-        raise VerifierHTTPError(code if isinstance(code, int) else None, str(message)[:300])
-    try:
-        content = body["choices"][0]["message"].get("content")
-    except (KeyError, IndexError, TypeError, AttributeError) as error:
-        raise ValueError(f"Unexpected OpenRouter response: {str(body)[:200]}") from error
+    content = ai_message.content
+    response_meta = ai_message.response_metadata or {}
+    usage = response_meta.get("token_usage") or {}
     if not isinstance(content, str) or not content.strip():
-        choice = body["choices"][0]
         logger.error(
             "[EMPTY RESPONSE] %s | model=%s | finish_reason=%s | completion_tokens=%s | "
             "reasoning_chars=%d | reasoning_setting=%s",
-            stage_label, model, choice.get("finish_reason"),
-            (body.get("usage") or {}).get("completion_tokens"),
-            len(str(choice["message"].get("reasoning") or "")), reasoning,
+            stage_label, model, response_meta.get("finish_reason"),
+            usage.get("completion_tokens"),
+            len(str(ai_message.additional_kwargs.get("reasoning") or "")), reasoning,
         )
         raise ValueError(f"OpenRouter returned an empty response for {stage_label}")
 
-    usage = body.get("usage") or {}
     in_tok = count_input_tokens(prompt, usage.get("prompt_tokens"))
     out_tok = count_output_tokens(content, usage.get("completion_tokens"))
     logger.info(
@@ -1097,7 +1143,7 @@ def draft(question, subset, draft_idx=None, token_tracker=None):
     stalls or aborts the whole question. Auth/credit errors (401-404) still propagate.
     """
     docs_text = "\n\n".join(f"[{i}] {d}" for i, d in enumerate(subset, start=1))
-    prompt = DRAFT_PROMPT.format(docs=docs_text, question=question)
+    variables = {"docs": docs_text, "question": question}
     model = DRAFT_MODEL
     label = f"Draft {draft_idx}" if draft_idx is not None else "Draft"
     logger.info("[DRAFT] Calling %s for %s with %d chunks", model, label, len(subset))
@@ -1108,7 +1154,7 @@ def draft(question, subset, draft_idx=None, token_tracker=None):
         retrying = attempt > 0
         try:
             raw = _call_openrouter_text(
-                prompt, model, label if not retrying else f"{label} (retry {attempt})",
+                DRAFT_TEMPLATE, variables, model, label if not retrying else f"{label} (retry {attempt})",
                 token_tracker=token_tracker, json_mode=True,
                 # On a retry, force reasoning off and add a little randomness: greedy
                 # decoding is what tends to get stuck in repetition loops.
@@ -1206,6 +1252,9 @@ Return JSON only, with exactly {n} scores (one per candidate, in the same order,
 each a number from 0 to 10), in this shape:
 {example}
 """
+# "{retry_note}" is empty on the first attempt; on a retry verify() fills it with the
+# "previous reply was invalid" reminder, which used to be appended to the prompt string.
+VERIFY_TEMPLATE = ChatPromptTemplate.from_messages([("human", VERIFY_PROMPT + "{retry_note}")])
 
 TIE_BREAK_PROMPT = """You are the final decision-maker in a strict evidence-based
 comparison of tied candidate answers. You MUST select exactly ONE winner.
@@ -1257,6 +1306,7 @@ Tied candidate drafts:
 Return valid JSON only, with exactly these keys:
 {{"winner_index": 0, "reason": "Briefly explain the decisive evidence-based reason."}}
 """
+TIE_BREAK_TEMPLATE = ChatPromptTemplate.from_messages([("human", TIE_BREAK_PROMPT)])
 
 _verify_lock = threading.Lock()
 _quota_exhausted = threading.Event()
@@ -1302,49 +1352,25 @@ def _extract_json(text):
         return json.loads(match.group(0))
 
 
-def call_verifier(prompt, stage_label="verify", token_tracker=None):
-    """Send one prompt to the OpenRouter model and return the parsed JSON reply."""
-    started = time.perf_counter()
+def call_verifier(template, variables, stage_label="verify", token_tracker=None):
+    """Run a ChatPromptTemplate through the OpenRouter verifier model (LangChain) and return the parsed JSON reply."""
+    prompt_value = template.invoke(variables)
+    prompt = prompt_value.to_messages()[0].content   # rendered prompt, used for token estimates
     model = VERIFY_MODEL
+    llm = _chat_model(model, 0, VERIFY_TIMEOUT, _extra_body_json(True, None, None))
+    started = time.perf_counter()
     try:
-        response = requests.post(
-            OPENROUTER_CHAT_URL,
-            headers={
-                "Authorization": f"Bearer {OPENROUTER_CHAT_API_KEY}",
-                "Content-Type": "application/json",
-            },
-            json={
-                "model": model,
-                "messages": [{"role": "user", "content": prompt}],
-                "temperature": 0,
-                "response_format": {"type": "json_object"},
-                "usage": {"include": True},
-            },
-            timeout=VERIFY_TIMEOUT,
-        )
-    except requests.RequestException as error:
+        ai_message = llm.invoke(prompt_value)
+    except openai.APIConnectionError as error:
         raise VerifierHTTPError(None, f"network error: {error}") from error
+    except openai.APIStatusError as error:
+        raise _status_error(error) from error
+    except _BODY_ERRORS as error:  # OpenRouter can return an error object with HTTP 200
+        raise _body_error(error) from error
 
     elapsed = time.perf_counter() - started
-    if response.status_code != 200:
-        retry_after = response.headers.get("Retry-After")
-        raise VerifierHTTPError(
-            response.status_code,
-            response.text[:300],
-            float(retry_after) if retry_after and retry_after.replace(".", "", 1).isdigit() else None,
-        )
-    body = response.json()
-    if body.get("error"):  # OpenRouter can return an error object with HTTP 200
-        err = body["error"]
-        code = err.get("code") if isinstance(err, dict) else None
-        message = err.get("message") if isinstance(err, dict) else str(err)
-        raise VerifierHTTPError(code if isinstance(code, int) else None, str(message)[:300])
-    try:
-        content = body["choices"][0]["message"].get("content")
-    except (KeyError, IndexError, TypeError, AttributeError) as error:
-        raise ValueError(f"Unexpected OpenRouter response: {str(body)[:200]}") from error
-
-    usage = body.get("usage") or {}
+    content = ai_message.content
+    usage = (ai_message.response_metadata or {}).get("token_usage") or {}
     in_tok = count_input_tokens(prompt, usage.get("prompt_tokens"))
     out_tok = count_output_tokens(content or "", usage.get("completion_tokens"))
     logger.info(
@@ -1425,17 +1451,17 @@ def resolve_tie(question, source_documents, candidates, tied_indexes, retries=3,
         candidate for candidate in candidates
         if candidate["index"] in tied_indexes
     ]
-    prompt = TIE_BREAK_PROMPT.format(
-        question=question,
-        source_documents=json.dumps(source_documents, ensure_ascii=False),
-        tied_candidates=json.dumps(tied_candidates, ensure_ascii=False),
-    )
+    variables = {
+        "question": question,
+        "source_documents": json.dumps(source_documents, ensure_ascii=False),
+        "tied_candidates": json.dumps(tied_candidates, ensure_ascii=False),
+    }
     last_error = None
     for attempt in range(retries):
         wait_for_slot()
         try:
             data = call_verifier(
-                prompt,
+                TIE_BREAK_TEMPLATE, variables,
                 stage_label="tie-break",
                 token_tracker=token_tracker,
             )
@@ -1468,23 +1494,23 @@ def verify(question, drafts, subsets, retries=5, token_tracker=None):
         raise ValueError("Cannot verify an empty list of drafts")
     source_documents, candidates = _build_verification_inputs(drafts, subsets)
     n = len(drafts)
-    prompt = VERIFY_PROMPT.format(
-        question=question,
-        source_documents=json.dumps(source_documents, ensure_ascii=False),
-        candidates=json.dumps(candidates, ensure_ascii=False),
-        n=n,
-        example='{"scores": [' + ", ".join(f"<score for candidate {i}>" for i in range(n)) + "]}",
-    )
+    variables = {
+        "question": question,
+        "source_documents": json.dumps(source_documents, ensure_ascii=False),
+        "candidates": json.dumps(candidates, ensure_ascii=False),
+        "n": n,
+        "example": '{"scores": [' + ", ".join(f"<score for candidate {i}>" for i in range(n)) + "]}",
+    }
     last_error = None
     for attempt in range(retries):
         wait_for_slot()
         try:
-            attempt_prompt = prompt if attempt == 0 else (
-                prompt + f"\n\nYour previous reply was invalid. Return exactly {n} "
-                         f"numeric scores between 0 and 10 in a JSON list."
+            retry_note = "" if attempt == 0 else (
+                f"\n\nYour previous reply was invalid. Return exactly {n} "
+                f"numeric scores between 0 and 10 in a JSON list."
             )
             data = call_verifier(
-                attempt_prompt,
+                VERIFY_TEMPLATE, {**variables, "retry_note": retry_note},
                 stage_label="scoring",
                 token_tracker=token_tracker,
             )
@@ -1552,6 +1578,7 @@ Conversation:
 New question: {question}
 
 Standalone question:"""
+REWRITE_TEMPLATE = ChatPromptTemplate.from_messages([("human", REWRITE_PROMPT)])
 
 
 def rewrite_question(question, history, token_tracker=None):
@@ -1570,12 +1597,12 @@ def rewrite_question(question, history, token_tracker=None):
         speaker = "User" if m["role"] == "user" else "Assistant"
         text = " ".join(str(m["content"]).split())[:HISTORY_CHARS]
         lines.append(f"{speaker}: {text}")
-    prompt = REWRITE_PROMPT.format(history="\n".join(lines), question=question)
+    variables = {"history": "\n".join(lines), "question": question}
     model = DRAFT_MODEL
     logger.info("[STAGE: REWRITING] Resolving follow-up question context with OpenRouter (%s)...", model)
     try:
         rewritten = _call_openrouter_text(
-            prompt, model, "question rewrite", token_tracker=token_tracker,
+            REWRITE_TEMPLATE, variables, model, "question rewrite", token_tracker=token_tracker,
             reasoning={"enabled": False},
             timeout=SHORT_TASK_TIMEOUT, attempts=SHORT_TASK_ATTEMPTS,
         )
