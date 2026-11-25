@@ -1114,6 +1114,20 @@ wheels = [
 ]
 
 [[package]]
+name = "langchain-chroma"
+version = "1.2.0"
+source = { registry = "https://pypi.org/simple" }
+dependencies = [
+    { name = "chromadb" },
+    { name = "langchain-core" },
+    { name = "numpy" },
+]
+sdist = { url = "https://files.pythonhosted.org/packages/e1/b3/37eb7a9a12c4d49bb3bd07ffc40d0fcdfeaeb9f6a6c2b428afee69ee6694/langchain_chroma-1.2.0.tar.gz", hash = "sha256:609c8b554ce9d11e99db8520fed021c5dbbcf525bd6ae04707a87d0147d142fa", size = 186924, upload-time = "2026-11-23T17:04:38.196Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/90/04/ef72ea667882268227ffeafc27882b1e7ae75bde03db4407db1802ab5e7b/langchain_chroma-1.2.0-py3-none-any.whl", hash = "sha256:54e7c8e1b347c1f8bc6becdc641410f8947629a013b70ca58a51330bfcdcbd2c", size = 13536, upload-time = "2026-11-23T17:04:37.48Z" },
+]
+
+[[package]]
 name = "langchain-core"
 version = "1.8.4"
 source = { registry = "https://pypi.org/simple" }
@@ -2863,6 +2877,7 @@ backend = [
     { name = "chromadb" },
     { name = "fastapi" },
     { name = "google-genai" },
+    { name = "langchain-chroma" },
     { name = "langchain-core" },
     { name = "langchain-openai" },
     { name = "numpy" },
@@ -2906,6 +2921,7 @@ backend = [
     { name = "chromadb", specifier = ">=1.5.9" },
     { name = "fastapi" },
     { name = "google-genai", specifier = ">=2.31.0" },
+    { name = "langchain-chroma", specifier = ">=1.0.0" },
     { name = "langchain-core", specifier = ">=1.8.4" },
     { name = "langchain-openai", specifier = ">=1.8.5" },
     { name = "numpy", specifier = ">=2.5.4" },

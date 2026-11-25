@@ -10,6 +10,8 @@ import time
 import threading
 from collections import Counter
 from functools import lru_cache
+from contextlib import contextmanager
+from contextvars import ContextVar
 
 import numpy as np
 import openai
@@ -19,6 +21,9 @@ import pandas as pd
 from dotenv import load_dotenv
 from sklearn.cluster import KMeans
 from langchain_core.prompts import ChatPromptTemplate
+from langchain_core.runnables import RunnableLambda
+from langchain_core.output_parsers import StrOutputParser
+from langchain_chroma import Chroma
 from langchain_openai import ChatOpenAI, OpenAIEmbeddings
 
 try:
@@ -230,12 +235,8 @@ LEGACY_COLLECTIONS = ("docs", "arabic_docs")   # old language-split indexes, dro
 
 
 def get_chroma_collection():
-    """Return the single persistent ChromaDB collection (created if missing)."""
-    client = chromadb.PersistentClient(path=CHROMA_PATH)
-    return client.get_or_create_collection(
-        name=COLLECTION_NAME,
-        metadata={"hnsw:space": "cosine"},
-    )
+    """Return the collection managed by the LangChain Chroma vector store."""
+    return get_vectorstore()._collection
 
 
 def extract_pdf(pdf_path):
@@ -324,125 +325,121 @@ def split_text_to_chunks(text):
     return chunks
 
 
+_EMBEDDING_CONTEXT = ContextVar("embedding_usage_context", default=None)
+
+
+@contextmanager
+def _track_embedding_usage(token_tracker=None, capture_query=False):
+    """Track estimated embedding usage for calls made by LangChain components."""
+    context = {"tracker": token_tracker, "capture_query": capture_query}
+    token = _EMBEDDING_CONTEXT.set(context)
+    try:
+        yield context
+    finally:
+        _EMBEDDING_CONTEXT.reset(token)
+
+
+def _record_embedding_usage(texts, vectors):
+    context = _EMBEDDING_CONTEXT.get()
+    if not context:
+        return
+    tracker = context["tracker"]
+    if tracker is not None:
+        input_tokens = sum(_estimate_tokens(text) for text in texts)
+        calls = max(1, (len(texts) + EMBED_BATCH_SIZE - 1) // EMBED_BATCH_SIZE)
+        cost = (input_tokens / 1_000_000) * EMBEDDING_INPUT_PRICE_PER_M
+        tracker["embedding_input_tokens"] = tracker.get("embedding_input_tokens", 0) + input_tokens
+        tracker["embedding_cost"] = tracker.get("embedding_cost", 0.0) + cost
+        tracker["embedding_calls"] = tracker.get("embedding_calls", 0) + calls
+        tracker["embedding_estimated_cost_calls"] = (
+            tracker.get("embedding_estimated_cost_calls", 0) + calls
+        )
+    if context["capture_query"] and len(texts) == 1:
+        context["query_embedding"] = vectors[0]
+
+
+class UsageTrackingOpenAIEmbeddings(OpenAIEmbeddings):
+    """LangChain OpenAI-compatible embeddings with optional local usage estimates."""
+
+    def embed_documents(self, texts, chunk_size=None, **kwargs):
+        if not texts:
+            return []
+        for attempt in range(3):
+            try:
+                vectors = super().embed_documents(texts, chunk_size=chunk_size, **kwargs)
+                break
+            except openai.APIError as error:
+                status = getattr(error, "status_code", None)
+                if status in (401, 402, 403, 404) or attempt == 2:
+                    raise
+                logger.warning(
+                    "[EMBEDDING] LangChain request failed (attempt %d/3): %s; retrying",
+                    attempt + 1,
+                    error,
+                )
+                time.sleep(2 ** attempt)
+        _record_embedding_usage(texts, vectors)
+        return vectors
+
+
 @lru_cache(maxsize=1)
 def _embedder():
-    """LangChain embeddings client pointed at OpenRouter (shared by all threads).
-
-    check_embedding_ctx_length=False makes LangChain send the raw strings instead of
-    tiktoken token ids (which only OpenAI's own endpoint understands). max_retries=0
-    keeps the retry/backoff policy in get_embeddings, exactly as before.
-    """
-    return OpenAIEmbeddings(
+    """Return the shared LangChain embedding model configured for OpenRouter."""
+    return UsageTrackingOpenAIEmbeddings(
         model=EMBED_MODEL,
         api_key=OPENROUTER_API_KEY,
         base_url=OPENROUTER_BASE_URL,
         check_embedding_ctx_length=False,
+        chunk_size=EMBED_BATCH_SIZE,
         timeout=120,
         max_retries=0,
     )
 
 
+@lru_cache(maxsize=1)
+def get_vectorstore():
+    """Return the persistent LangChain Chroma vector store."""
+    return Chroma(
+        collection_name=COLLECTION_NAME,
+        persist_directory=CHROMA_PATH,
+        embedding_function=_embedder(),
+        collection_metadata={"hnsw:space": "cosine"},
+    )
+
+
 def get_embeddings(texts, purpose="embedding", token_tracker=None):
-    """Embed texts through OpenRouter and log token usage plus USD cost.
-
-    Embeddings are input-only: cost is based on the number of input tokens sent
-    to the embedding endpoint. Provider usage/cost is preferred when returned;
-    otherwise token count is estimated locally and priced using the configured
-    per-million-token rate.
-    """
-    vectors = []
-    total_tokens = 0
-    total_cost = 0.0
-    provider_cost_calls = 0
-    estimated_cost_calls = 0
-
-    embed_model = EMBED_MODEL
-    embedding_price = EMBEDDING_INPUT_PRICE_PER_M
-    logger.info("[EMBEDDING] Embedding %d text(s) | model=%s | purpose=%s", len(texts), embed_model, purpose)
-    for batch_number, start in enumerate(range(0, len(texts), EMBED_BATCH_SIZE), start=1):
-        batch = texts[start:start + EMBED_BATCH_SIZE]
-        for attempt in range(3):
-            try:
-                # LangChain's OpenAIEmbeddings owns the client/config; its underlying
-                # embeddings resource is used here so OpenRouter's reported usage and
-                # cost (which embed_documents() drops) are still available for the logs.
-                response = _embedder().client.create(
-                    input=batch, model=embed_model, encoding_format="float",
-                )
-                break
-            except openai.APIError as error:  # network, timeout and HTTP-status errors
-                status = getattr(error, "status_code", None)
-                if status in (401, 402, 403, 404):
-                    hint = {401: "invalid API key", 402: "OpenRouter credit exhausted - add credit",
-                            403: "access denied", 404: "embedding model not found"}[status]
-                    logger.error("[EMBEDDING] Request failed with HTTP %s (%s); not retrying: %s",
-                                 status, hint, error)
-                    raise
-                if attempt == 2:
-                    raise
-                logger.warning(
-                    "Embedding request failed (attempt %d/3): %s. Retrying...",
-                    attempt + 1,
-                    error,
-                )
-                time.sleep(2 ** attempt)
-        body = response.model_dump()
-        data = sorted(body["data"], key=lambda item: item["index"])
-        vectors.extend(item["embedding"] for item in data)
-
-        usage = body.get("usage") or {}
-        reported_tokens = usage.get("prompt_tokens")
-        if not isinstance(reported_tokens, int) or reported_tokens < 0:
-            reported_tokens = usage.get("total_tokens")
-        if isinstance(reported_tokens, int) and reported_tokens >= 0:
-            input_tokens = reported_tokens
-            token_source = "provider-reported"
-        else:
-            input_tokens = sum(_estimate_tokens(item) for item in batch)
-            token_source = "local-estimate"
-
-        reported_cost = usage.get("cost")
-        if isinstance(reported_cost, (int, float)) and reported_cost >= 0:
-            batch_cost = float(reported_cost)
-            cost_source = "provider-reported"
-            provider_cost_calls += 1
-        else:
-            batch_cost = (input_tokens / 1_000_000) * embedding_price
-            cost_source = "rate-estimate"
-            estimated_cost_calls += 1
-
-        total_tokens += input_tokens
-        total_cost += batch_cost
-
-        if token_tracker is not None:
-            token_tracker["embedding_input_tokens"] = token_tracker.get("embedding_input_tokens", 0) + input_tokens
-            token_tracker["embedding_cost"] = token_tracker.get("embedding_cost", 0.0) + batch_cost
-            token_tracker["embedding_calls"] = token_tracker.get("embedding_calls", 0) + 1
-            token_tracker["embedding_provider_reported_cost_calls"] = (
-                token_tracker.get("embedding_provider_reported_cost_calls", 0)
-                + int(cost_source == "provider-reported")
-            )
-            token_tracker["embedding_estimated_cost_calls"] = (
-                token_tracker.get("embedding_estimated_cost_calls", 0)
-                + int(cost_source == "rate-estimate")
-            )
-
-        logger.info(
-            "[EMBEDDING COST] model=%s | purpose=%s | batch=%d | texts=%d | "
-            "input_tokens=%d (%s) | cost=$%.10f (%s) | rate=$%.4f/1M tokens",
-            embed_model, purpose, batch_number, len(batch), input_tokens,
-            token_source, batch_cost, cost_source, embedding_price,
-        )
-
-    if texts:
-        logger.info(
-            "[EMBEDDING SUMMARY] model=%s | purpose=%s | texts=%d | "
-            "input_tokens=%d | total_cost=$%.10f USD | provider_cost_batches=%d | "
-            "estimated_cost_batches=%d",
-            embed_model, purpose, len(texts), total_tokens, total_cost,
-            provider_cost_calls, estimated_cost_calls,
-        )
+    """Embed through LangChain and report token/rate estimates."""
+    usage = {}
+    with _track_embedding_usage(usage):
+        vectors = _embedder().embed_documents(texts)
+    if token_tracker is not None:
+        for key, value in usage.items():
+            token_tracker[key] = token_tracker.get(key, 0) + value
+    logger.info(
+        "[EMBEDDING] LangChain OpenAIEmbeddings | model=%s | purpose=%s | "
+        "texts=%d | estimated_input_tokens=%d | estimated_cost=$%.10f",
+        EMBED_MODEL, purpose, len(texts),
+        usage.get("embedding_input_tokens", 0), usage.get("embedding_cost", 0.0),
+    )
     return vectors
+
+
+def _initialize_token_tracker(token_tracker):
+    """Fill the usage counters required by embedding and drafting calls."""
+    defaults = {
+        "embedding_input_tokens": 0,
+        "embedding_cost": 0.0,
+        "embedding_calls": 0,
+        "embedding_provider_reported_cost_calls": 0,
+        "embedding_estimated_cost_calls": 0,
+        "draft_openrouter_input": 0,
+        "draft_openrouter_output": 0,
+        "draft_openrouter_cost": 0.0,
+        "draft_openrouter_cost_provider_reported_calls": 0,
+        "draft_openrouter_cost_estimated_calls": 0,
+    }
+    for key, value in defaults.items():
+        token_tracker.setdefault(key, value)
 
 
 def file_sha256(path):
@@ -528,33 +525,32 @@ def ingest_document(document_path, name=None, progress_callback=None):
 
         def embed_batch(positions):
             usage = {}
-            vectors = get_embeddings(
-                [chunks[position] for position in positions],
-                purpose=f"indexing:{name}", token_tracker=usage,
-            )
-            return positions, vectors, usage
+            batch = [chunks[position] for position in positions]
+            ids = [ids_all[position] for position in positions]
+            metadatas = [{
+                "source": name,
+                "file_hash": file_hash,
+                "embed_model": EMBED_MODEL,
+                "total_chunks": total,
+                "chunk_id": chunk_id,
+            } for chunk_id in ids]
+            with _track_embedding_usage(usage):
+                get_vectorstore().add_texts(
+                    texts=batch,
+                    metadatas=metadatas,
+                    ids=ids,
+                )
+            return positions, usage
 
         # EMBED_WORKERS requests run in parallel; results are stored in order from this
         # thread only, so an interruption always leaves a clean, resumable prefix.
         with ThreadPoolExecutor(max_workers=max(1, EMBED_WORKERS)) as pool:
             for group_start in range(0, len(batches), max(1, EMBED_WORKERS)):
                 group = batches[group_start:group_start + max(1, EMBED_WORKERS)]
-                for positions, batch_vectors, batch_usage in pool.map(embed_batch, group):
-                    batch = [chunks[position] for position in positions]
+                for positions, batch_usage in pool.map(embed_batch, group):
                     document_embedding_cost += batch_usage.get("embedding_cost", 0.0)
                     document_embedding_tokens += batch_usage.get("embedding_input_tokens", 0)
-                    collection.add(
-                        documents=batch,
-                        embeddings=batch_vectors,
-                        metadatas=[{
-                            "source": name,
-                            "file_hash": file_hash,
-                            "embed_model": EMBED_MODEL,
-                            "total_chunks": total,
-                        }] * len(batch),
-                        ids=[ids_all[position] for position in positions],
-                    )
-                    stored += len(batch)
+                    stored += len(positions)
                     logger.info("[STAGE: INDEXING] %s: stored %d/%d chunks", name, stored, total)
                     if progress_callback:
                         progress_callback(stored, total)
@@ -596,6 +592,9 @@ def build_index():
                 sample.get("embed_model"), EMBED_MODEL,
             )
             client.delete_collection(name=COLLECTION_NAME)
+            get_vectorstore.cache_clear()
+            collection = get_chroma_collection()
+    _ensure_vectorstore_chunk_ids(collection)
 
     document_paths = sorted(
         path for path in DOCS_DIR.iterdir()
@@ -635,6 +634,36 @@ def delete_document(name):
     path = DOCS_DIR / Path(name).name
     if path.exists():
         path.unlink()
+
+
+def _ensure_vectorstore_chunk_ids(collection, batch_size=1000):
+    """Persist each Chroma record ID in metadata for LangChain result de-duplication."""
+    updated = 0
+    offset = 0
+    while True:
+        batch = collection.get(
+            limit=batch_size,
+            offset=offset,
+            include=["metadatas"],
+        )
+        ids = batch["ids"]
+        if not ids:
+            break
+        metadatas = batch["metadatas"]
+        update_ids = []
+        update_metadatas = []
+        for chunk_id, metadata in zip(ids, metadatas):
+            metadata = dict(metadata or {})
+            if metadata.get("chunk_id") != chunk_id:
+                metadata["chunk_id"] = chunk_id
+                update_ids.append(chunk_id)
+                update_metadatas.append(metadata)
+        if update_ids:
+            collection.update(ids=update_ids, metadatas=update_metadatas)
+            updated += len(update_ids)
+        offset += len(ids)
+    if updated:
+        logger.info("[INDEX] Added stable chunk IDs to %d existing vector metadata records", updated)
 
 
 # --------------------------------------------------------------------------- #
@@ -728,34 +757,42 @@ def retrieve(question, k=DEFAULT_RETRIEVAL_K, return_distances=False, source=Non
         min(k, count), count, source or "all documents", len(queries), EMBED_MODEL, COLLECTION_NAME,
     )
 
-    query_embeddings = get_embeddings(
-        [text for _, text in queries], purpose="question-retrieval", token_tracker=token_tracker,
-    )
     n_results = min(k, count)
     merged = {}  # chunk id -> (document, metadata, embedding, distance, query label)
-    for (label, text), q_emb in zip(queries, query_embeddings):
-        query_args = dict(
-            query_embeddings=[q_emb],
-            n_results=n_results,
-            include=["documents", "metadatas", "embeddings", "distances"],
-        )
-        if where:
-            query_args["where"] = where
-        result = collection.query(**query_args)
-        ids = result["ids"][0]
-        distances = result["distances"][0]
+    for label, text in queries:
+        embedding_usage = {}
+        with _track_embedding_usage(embedding_usage, capture_query=True) as embedding_context:
+            results = get_vectorstore().similarity_search_with_vectors(
+                text, k=n_results, filter=where,
+            )
+        if token_tracker is not None:
+            for key, value in embedding_usage.items():
+                token_tracker[key] = token_tracker.get(key, 0) + value
+        q_emb = np.asarray(embedding_context["query_embedding"], dtype=float)
+        q_norm = np.linalg.norm(q_emb)
+        distances = []
+        for document, vector in results:
+            vector = np.asarray(vector, dtype=float)
+            denominator = q_norm * np.linalg.norm(vector)
+            distance = 1.0 - (
+                float(np.dot(q_emb, vector) / denominator) if denominator else 0.0
+            )
+            distances.append(distance)
         logger.info(
             "[RETRIEVAL] Query %-10s | %r | hits=%d | best_distance=%.4f | worst_distance=%.4f",
-            label, text, len(ids),
+            label, text, len(results),
             min(distances) if len(distances) else float("nan"),
             max(distances) if len(distances) else float("nan"),
         )
-        for chunk_id, doc, meta, emb, dist in zip(
-            ids, result["documents"][0], result["metadatas"][0],
-            result["embeddings"][0], distances,
-        ):
+        for (document, vector), dist in zip(results, distances):
+            doc = document.page_content
+            meta = document.metadata
+            chunk_id = (
+                meta.get("chunk_id")
+                or f"{meta.get('source', '')}:{hashlib.sha256(doc.encode('utf-8')).hexdigest()}"
+            )
             if chunk_id not in merged or dist < merged[chunk_id][3]:
-                merged[chunk_id] = (doc, meta, emb, float(dist), label)
+                merged[chunk_id] = (doc, meta, vector, float(dist), label)
 
     ranked = sorted(merged.values(), key=lambda item: item[3])[:n_results]
     from_counts = Counter(item[4] for item in ranked)
@@ -1067,19 +1104,31 @@ def _body_error(error):
 _BODY_ERRORS = (ValueError, TypeError, KeyError, IndexError, AttributeError)
 
 
+def _invoke_chat_lcel(template, variables, llm):
+    """Run prompt | model | capture-message | string-parser and retain usage metadata."""
+    prompt = template.invoke(variables).to_messages()[0].content
+    captured = {}
+
+    def capture_message(message):
+        captured["message"] = message
+        return message
+
+    chain = template | llm | RunnableLambda(capture_message) | StrOutputParser()
+    content = chain.invoke(variables)
+    return prompt, content, captured["message"]
+
+
 def _call_openrouter_text(template, variables, model, stage_label, token_tracker=None, json_mode=False,
                           reasoning=None, timeout=VERIFY_TIMEOUT, max_tokens=None,
                           temperature=0, attempts=3):
     """Run a ChatPromptTemplate through an OpenRouter chat model (LangChain) and return its text."""
-    prompt_value = template.invoke(variables)
-    prompt = prompt_value.to_messages()[0].content   # rendered prompt, used for token estimates
     llm = _chat_model(model, temperature, timeout, _extra_body_json(json_mode, reasoning, max_tokens))
 
     ai_message = None
     started = time.perf_counter()
     for attempt in range(attempts):
         try:
-            ai_message = llm.invoke(prompt_value)
+            prompt, content, ai_message = _invoke_chat_lcel(template, variables, llm)
             break
         except openai.APIConnectionError as error:   # network error or timeout
             if attempt == attempts - 1:
@@ -1094,7 +1143,6 @@ def _call_openrouter_text(template, variables, model, stage_label, token_tracker
             raise _body_error(error) from error
 
     elapsed = time.perf_counter() - started
-    content = ai_message.content
     response_meta = ai_message.response_metadata or {}
     usage = response_meta.get("token_usage") or {}
     if not isinstance(content, str) or not content.strip():
@@ -1129,6 +1177,57 @@ def _call_openrouter_text(template, variables, model, stage_label, token_tracker
         logger.info("[COST | OpenRouter %s] %s cost=$%.10f (%s)",
                     model, stage_label, call_cost, cost_source)
     return content
+
+
+RAG_ANSWER_PROMPT = """Answer the question using only the supplied document context.
+Respond in the same language as the question. If the context does not contain the answer,
+say that you could not find it in the documents. Do not invent facts.
+
+Question:
+{question}
+
+Document context:
+{context}
+"""
+RAG_ANSWER_TEMPLATE = ChatPromptTemplate.from_messages([("human", RAG_ANSWER_PROMPT)])
+
+
+def build_rag_chain(k=DEFAULT_RETRIEVAL_K, source=None, token_tracker=None):
+    """Build a standard LCEL retrieval -> prompt -> chat model -> string chain.
+
+    Invoke the returned chain with ``{"question": "..."}``. The speculative pipeline
+    continues to use the same LangChain retriever/model components, plus its clustering,
+    subset drafting, and verification stages.
+    """
+    if k < 1:
+        raise ValueError("Retrieval k must be at least 1.")
+
+    def retrieve_context(inputs):
+        if token_tracker is not None:
+            _initialize_token_tracker(token_tracker)
+        question = str(inputs["question"])
+        documents, metadatas, _ = retrieve(
+            question, k=k, source=source, token_tracker=token_tracker,
+        )
+        context = "\n\n".join(
+            f"[{metadata.get('source', 'document')}]\n{document}"
+            for document, metadata in zip(documents, metadatas)
+        )
+        return {"question": question, "context": context}
+
+    def generate_answer(inputs):
+        return _call_openrouter_text(
+            RAG_ANSWER_TEMPLATE,
+            inputs,
+            DRAFT_MODEL,
+            "plain RAG chain",
+            token_tracker=token_tracker,
+            reasoning=DRAFT_REASONING_PARAM,
+            timeout=DRAFT_TIMEOUT,
+            max_tokens=DRAFT_MAX_TOKENS,
+        )
+
+    return RunnableLambda(retrieve_context) | RunnableLambda(generate_answer)
 
 
 _FATAL_DRAFT_STATUSES = (401, 402, 403, 404)
@@ -1354,13 +1453,11 @@ def _extract_json(text):
 
 def call_verifier(template, variables, stage_label="verify", token_tracker=None):
     """Run a ChatPromptTemplate through the OpenRouter verifier model (LangChain) and return the parsed JSON reply."""
-    prompt_value = template.invoke(variables)
-    prompt = prompt_value.to_messages()[0].content   # rendered prompt, used for token estimates
     model = VERIFY_MODEL
     llm = _chat_model(model, 0, VERIFY_TIMEOUT, _extra_body_json(True, None, None))
     started = time.perf_counter()
     try:
-        ai_message = llm.invoke(prompt_value)
+        prompt, content, ai_message = _invoke_chat_lcel(template, variables, llm)
     except openai.APIConnectionError as error:
         raise VerifierHTTPError(None, f"network error: {error}") from error
     except openai.APIStatusError as error:
@@ -1369,7 +1466,6 @@ def call_verifier(template, variables, stage_label="verify", token_tracker=None)
         raise _body_error(error) from error
 
     elapsed = time.perf_counter() - started
-    content = ai_message.content
     usage = (ai_message.response_metadata or {}).get("token_usage") or {}
     in_tok = count_input_tokens(prompt, usage.get("prompt_tokens"))
     out_tok = count_output_tokens(content or "", usage.get("completion_tokens"))
