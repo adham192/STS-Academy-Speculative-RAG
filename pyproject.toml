@@ -39,6 +39,9 @@ backend = [
     "sqlalchemy>=2.0",
     "psycopg[binary]>=3.2",
     "redis>=5",
+    "langchain-openai>=1.8.5",
+    "langchain-core>=1.8.4",
+    "langchain-chroma>=1.0.0",
 ]
 # Docker frontend image: UI only
 frontend = [

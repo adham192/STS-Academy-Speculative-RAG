@@ -34,19 +34,32 @@ STS-Academy/
 
 ## What session 3 does
 
-This branch replaces plain retrieve-and-answer RAG with **Speculative RAG**: a small local model writes several draft answers in parallel, each from a different subset of the retrieved chunks, and a stronger model scores the drafts and picks the best one. It adds a Streamlit chat app, central logging, and an evaluation suite that finds which stage lost each wrong answer.
+This project uses **Speculative RAG**: a drafting model writes several candidate answers in parallel, each from a different subset of retrieved chunks, and a verifier model scores the drafts and selects the best-supported answer. It adds a Streamlit chat app, central logging, and an evaluation suite that identifies where a wrong answer was lost.
 
-**`Speculative_RAG.py`** handles the core pipeline:
+**`Speculative_RAG.py`** uses LangChain for document embeddings, Chroma vector storage, prompt templates, chat models, output parsing, and runnable chains:
 
-1. **PDF Ingestion & Chunking:** Reads PDFs with PyMuPDF, drops page numbers and table-of-contents lines, then splits the text into whole sentences (up to 1000 characters) with a 250-character overlap.
-2. **Embeddings & Vector Storage:** Batches chunks (20 at a time) to OpenRouter's embedding endpoint and stores vectors, text, and metadata (`source`, `file_hash`, `embed_model`) in a persistent ChromaDB collection using cosine distance. Unchanged files are skipped by SHA-256 hash, a changed file with the same name replaces its old chunks, and the index rebuilds automatically if the embedding model changes.
-3. **Retrieval & Subsets:** Retrieves the top-k chunks (default 10), clusters their embeddings with KMeans, and builds one subset per draft. Every subset shares the two highest-ranked chunks and adds one chunk from each cluster, so the drafts see different evidence.
-4. **Drafting (local Ollama model):** Each subset goes to the local model in parallel. It returns JSON with a `rationale` (an exact supporting quote) followed by a complete-sentence `answer`.
-5. **Verification (Gemini):** Gemini scores every draft from 0 to 10 using only the source passages. The highest score wins, and ties are broken by majority vote, then by the longer answer. Calls are spaced 13 seconds apart to stay inside the free-tier limit, with retries and a clear stop on quota or model-name errors.
+1. **Ingestion & chunking:** Reads PDF text or string fields from Parquet files, then creates overlapping chunks.
+2. **Embeddings & vector storage:** `OpenAIEmbeddings` calls the OpenAI-compatible OpenRouter endpoint. LangChain's `Chroma` vector store persists documents and vectors in the local Chroma database.
+3. **Similarity retrieval:** `Chroma.similarity_search_with_vectors()` retrieves ranked documents and their vectors. The vectors also feed the existing K-Means clustering and evidence-subset builder. Optional cross-lingual query translation lets Arabic and English queries search the same multilingual index.
+4. **Drafting & verification:** Prompt templates, `ChatOpenAI`, `RunnableLambda`, and `StrOutputParser` are composed with LCEL (`|`). Speculative RAG still orchestrates clustering, multiple draft calls, and evidence-based verification because those steps require branching and comparison.
+5. **Simple RAG chain:** `build_rag_chain()` exposes a standard retrieval → prompt → model → string-parser chain for callers that want a single answer without speculative drafting.
+
+Embedding costs are estimated from local token counts and the configured per-million-token rate because LangChain's embeddings interface does not expose OpenRouter's per-request cost metadata. Chat-model usage continues to use provider-reported cost when available.
+
+To run the simple LCEL chain from Python:
+
+```python
+from Speculative_RAG import build_rag_chain
+
+usage = {}
+chain = build_rag_chain(k=8, token_tracker=usage)
+answer = chain.invoke({"question": "What does the document say?"})
+print(usage)
+```
 
 **`app.py`** provides a Streamlit chat interface:
 
-- Upload PDFs and add them to the knowledge base, with a progress bar per file.
+- Upload PDFs or Parquet documents and add them to the knowledge base, with a progress bar per file.
 - List indexed documents with their chunk counts and remove any of them.
 - Chat with saved history: new chat, recent chats, full history, and delete.
 - Settings dialog for chunks per question (3 to 20), number of drafts (2 to 5), and whether to show sources under answers.
