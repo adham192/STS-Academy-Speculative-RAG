@@ -305,24 +305,64 @@ def extract_csv(csv_path):
     return "\n\n".join(blocks)
 
 
+def _flatten_json(value, path=""):
+    """Convert nested JSON values into searchable, labeled text lines."""
+    if isinstance(value, dict):
+        lines = []
+        for key, child in value.items():
+            child_path = f"{path}.{key}" if path else str(key)
+            lines.extend(_flatten_json(child, child_path))
+        return lines
+
+    if isinstance(value, list):
+        lines = []
+        for index, child in enumerate(value, start=1):
+            child_path = f"{path}[{index}]"
+            lines.extend(_flatten_json(child, child_path))
+        return lines
+
+    if value is None:
+        return []
+
+    return [f"{path}: {value}" if path else str(value)]
+
+
 def extract_json(json_path):
-    """Extract XQuAD passage text, leaving its questions and answers out."""
+    """Extract XQuAD passages or flatten a general JSON document."""
     with open(json_path, encoding="utf-8") as file:
         data = json.load(file)
 
-    if not isinstance(data, dict) or not isinstance(data.get("data"), list):
-        raise ValueError("Expected an XQuAD JSON file with a 'data' list.")
+    articles = data.get("data") if isinstance(data, dict) else None
+    is_xquad = (
+        isinstance(articles, list)
+        and bool(articles)
+        and all(
+            isinstance(article, dict)
+            and isinstance(article.get("paragraphs"), list)
+            for article in articles
+        )
+        and any(
+            isinstance(paragraph, dict)
+            and isinstance(paragraph.get("context"), str)
+            and isinstance(paragraph.get("qas"), list)
+            for article in articles
+            for paragraph in article["paragraphs"]
+        )
+    )
 
-    blocks = []
-    for article in data["data"]:
-        title = article.get("title", "")
+    if is_xquad:
+        blocks = []
+        for article in articles:
+            title = article.get("title", "")
 
-        for paragraph in article.get("paragraphs", []):
-            context = paragraph.get("context", "").strip()
-            if context:
-                blocks.append(f"Title: {title}\n{context}")
+            for paragraph in article["paragraphs"]:
+                context = paragraph.get("context", "")
+                if isinstance(context, str) and context.strip():
+                    blocks.append(f"Title: {title}\n{context}")
 
-    return "\n\n".join(blocks)
+        return "\n\n".join(blocks)
+
+    return "\n".join(_flatten_json(data))
 
 
 def extract_document(document_path):
