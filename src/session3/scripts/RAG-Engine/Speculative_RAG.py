@@ -145,8 +145,8 @@ def get_index_status():
     with _index_status_lock:
         return dict(INDEX_STATUS)
 
-if not any(path.suffix.lower() in (".pdf", ".parquet", ".pq") for path in DOCS_DIR.iterdir()):
-    logger.warning("No PDF or Parquet documents found in %s yet.", DOCS_DIR)
+if not any(path.suffix.lower() in (".pdf", ".parquet", ".pq", ".csv", ".json") for path in DOCS_DIR.iterdir()):
+    logger.warning("No PDF, Parquet, CSV, or JSON documents found in %s yet.", DOCS_DIR)
 
 logger.info("OpenRouter verifier model: %r | drafting model: %r", VERIFY_MODEL, DRAFT_MODEL)
 
@@ -278,13 +278,65 @@ def extract_parquet(parquet_path):
             blocks.append(f"[Row {row_number}] " + "\n".join(parts))
     return "\n\n".join(blocks)
 
+def extract_csv(csv_path):
+    """Convert each CSV row into labeled text for retrieval."""
+    frame = pd.read_csv(
+        csv_path,
+        dtype=str,
+        keep_default_na=False,
+        encoding="utf-8-sig",
+    )
+
+    blocks = []
+    for row_number, (_, row) in enumerate(frame.iterrows(), start=1):
+        parts = []
+
+        for column, value in row.items():
+            if column == "Poster_Link":
+                continue
+
+            value = str(value).strip()
+            if value:
+                parts.append(f"{column}: {value}")
+
+        if parts:
+            blocks.append(f"[Row {row_number}]\n" + "\n".join(parts))
+
+    return "\n\n".join(blocks)
+
+
+def extract_json(json_path):
+    """Extract XQuAD passage text, leaving its questions and answers out."""
+    with open(json_path, encoding="utf-8") as file:
+        data = json.load(file)
+
+    if not isinstance(data, dict) or not isinstance(data.get("data"), list):
+        raise ValueError("Expected an XQuAD JSON file with a 'data' list.")
+
+    blocks = []
+    for article in data["data"]:
+        title = article.get("title", "")
+
+        for paragraph in article.get("paragraphs", []):
+            context = paragraph.get("context", "").strip()
+            if context:
+                blocks.append(f"Title: {title}\n{context}")
+
+    return "\n\n".join(blocks)
+
 
 def extract_document(document_path):
     suffix = Path(document_path).suffix.lower()
+
     if suffix == ".pdf":
         return extract_pdf(document_path)
     if suffix in (".parquet", ".pq"):
         return extract_parquet(document_path)
+    if suffix == ".csv":
+        return extract_csv(document_path)
+    if suffix == ".json":
+        return extract_json(document_path)
+
     raise ValueError(f"Unsupported document format: {suffix}")
 
 
@@ -457,7 +509,7 @@ def ingest_pdf(pdf_path, name=None, progress_callback=None):
 
 
 def ingest_document(document_path, name=None, progress_callback=None):
-    """Chunk, embed and store one PDF or Parquet document in ChromaDB.
+    """Chunk, embed and store one supported document in ChromaDB.
 
     Returns (status, chunk_count) where status is "added", "unchanged" or "empty".
     - Identical file already indexed  -> skipped ("unchanged").
@@ -467,7 +519,7 @@ def ingest_document(document_path, name=None, progress_callback=None):
     document_path = str(document_path)
     name = name or os.path.basename(document_path)
     suffix = Path(document_path).suffix.lower()
-    if suffix not in (".pdf", ".parquet", ".pq"):
+    if suffix not in (".pdf", ".parquet", ".pq", ".csv", ".json"):
         raise ValueError(f"Unsupported document format: {suffix}")
     file_hash = file_sha256(document_path)
     collection = get_chroma_collection()
@@ -570,7 +622,7 @@ def ingest_document(document_path, name=None, progress_callback=None):
 
 
 def build_index():
-    """Make sure every PDF/Parquet file in DOCS_DIR is indexed.
+    """Make sure every supported file in DOCS_DIR is indexed.
 
     Unchanged files are skipped quickly. Old language-split collections are dropped
     (they used different embedding spaces), and if the embedding model changed since
@@ -598,7 +650,7 @@ def build_index():
 
     document_paths = sorted(
         path for path in DOCS_DIR.iterdir()
-        if path.suffix.lower() in (".pdf", ".parquet", ".pq")
+        if path.suffix.lower() in (".pdf", ".parquet", ".pq", ".csv", ".json")
     )
     logger.info("[INDEX] Checking %d document(s) in %s", len(document_paths), DOCS_DIR)
     _set_index_status(state="indexing", document=None, done=0, total=0, error=None)
@@ -1872,7 +1924,7 @@ def answer_question(
     if not docs:
         logger.warning("No documents are indexed, nothing to answer from")
         return (
-            "No documents are indexed yet. Upload a PDF from the sidebar and "
+            "No documents are indexed yet. Upload a supported document from the sidebar and "
             "I'll be able to answer questions about it.",
             [],
         )

@@ -323,27 +323,29 @@ def settings_dialog():
 # Sidebar
 # --------------------------------------------------------------------------- #
 def ingest_uploads(files):
-    """Send uploaded PDF or Parquet documents to the backend."""
+    """Send uploaded documents to the backend."""
     for uploaded in files:
         name = Path(uploaded.name).name
         logger.info("Uploading document %s to the backend", name)
         try:
-            with st.spinner(f"Indexing {name}… (large PDFs can take a few minutes)"):
+            with st.spinner(f"Indexing {name}…"):
                 result = api_client.upload_document(name, uploaded.getvalue())
         except api_client.ApiError as exc:
             logger.error("Failed to index %s: %s", name, exc)
             st.error(f"Failed to index {name}: {exc}")
             continue
+
         status, chunks = result["status"], result["chunks"]
         logger.info("%s indexed: status=%s, chunks=%s", name, status, chunks)
+
         if status == "added":
             st.success(f"{name}: {chunks} chunks indexed.")
         elif status == "unchanged":
             st.info(f"{name} was already indexed.")
         else:
-            st.warning(f"No readable text found in {name} (scanned PDF?).")
-    ss.uploader_key += 1  # resets the uploader widget
+            st.warning(f"No readable text found in {name}.")
 
+    ss.uploader_key += 1  # Resets the uploader widget.
 
 def render_chat_list(limit=None):
     """Clickable list of saved chats, newest first."""
@@ -393,7 +395,7 @@ with st.sidebar:
     # ---- documents ----
     st.markdown('<div class="side-heading">Your Documents</div>', unsafe_allow_html=True)
     uploads = st.file_uploader(
-        "Upload documents", type=["pdf", "parquet", "pq"], accept_multiple_files=True,
+        "Upload documents", type=["pdf", "parquet", "pq", "csv", "json"], accept_multiple_files=True,
         key=f"uploader_{ss.uploader_key}", label_visibility="collapsed",
     )
     if uploads and st.button("Add to knowledge base", icon=":material/upload_file:",
@@ -431,7 +433,7 @@ with st.sidebar:
                  "distract the answer.",
         )
     else:
-        st.caption("No documents yet. Upload a PDF to get started.")
+        st.caption("No documents yet. Upload a supported document to get started.")
 
     # ---- chats ----
     if ss.show_history:
@@ -463,7 +465,7 @@ messages = ss.chats.get(ss.chat_id, {}).get("messages", [])
 welcome_area = st.empty()
 if not messages:
     with welcome_area.container():
-        st.markdown('''<div class="welcome"><div class="bot"><svg viewBox="0 0 80 80" fill="none" xmlns="http://www.w3.org/2000/svg" aria-label="Assistant robot"><g stroke="#9aafff" stroke-width="4" stroke-linecap="round" stroke-linejoin="round"><path d="M40 8v8M22 16l4 5M58 16l-4 5"/><rect x="18" y="26" width="44" height="36" rx="15"/><path d="M13 39v10M67 39v10"/></g><circle cx="31" cy="43" r="3" fill="#9aafff"/><circle cx="49" cy="43" r="3" fill="#9aafff"/><path d="M32 53c4 3 12 3 16 0" stroke="#9aafff" stroke-width="3" stroke-linecap="round"/></svg></div><h1>AI Assistant</h1><p>This is your AI Assistant that can help you summarize documents and search for specific small details in your document.<br>What do you have in mind?</p><p class="hint">Upload a PDF from the sidebar, then ask away.</p></div>''', unsafe_allow_html=True)
+        st.markdown('''<div class="welcome"><div class="bot"><svg viewBox="0 0 80 80" fill="none" xmlns="http://www.w3.org/2000/svg" aria-label="Assistant robot"><g stroke="#9aafff" stroke-width="4" stroke-linecap="round" stroke-linejoin="round"><path d="M40 8v8M22 16l4 5M58 16l-4 5"/><rect x="18" y="26" width="44" height="36" rx="15"/><path d="M13 39v10M67 39v10"/></g><circle cx="31" cy="43" r="3" fill="#9aafff"/><circle cx="49" cy="43" r="3" fill="#9aafff"/><path d="M32 53c4 3 12 3 16 0" stroke="#9aafff" stroke-width="3" stroke-linecap="round"/></svg></div><h1>AI Assistant</h1><p>This is your AI Assistant that can help you summarize documents and search for specific small details in your document.<br>What do you have in mind?</p><p class="hint">Upload a document from the sidebar, then ask away.</p></div>''', unsafe_allow_html=True)
 
 for message_index, message in enumerate(messages):
     render_chat_message(
