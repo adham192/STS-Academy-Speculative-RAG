@@ -131,10 +131,15 @@ def list_documents():
 
 @app.post("/documents")
 def upload_document(file: UploadFile = File(...)):
-    """Save an uploaded PDF or Parquet document and index it."""
+    """Save an uploaded supported document and index it."""
     name = Path(file.filename or "").name
-    if not name.lower().endswith((".pdf", ".parquet", ".pq")):
-        raise HTTPException(status_code=400, detail="Only PDF and Parquet files are supported.")
+    if not name.lower().endswith(
+        (".pdf", ".parquet", ".pq", ".csv", ".json")
+    ):
+        raise HTTPException(
+            status_code=400,
+            detail="Supported files: PDF, Parquet, CSV, and XQuAD JSON.",
+        )
     rag = app.state.rag
     target = rag.DOCS_DIR / name
     target.write_bytes(file.file.read())
