@@ -18,6 +18,8 @@ dependencies = [
     "python-dotenv>=1.2.4",
     "requests>=2.34.2",
     "scikit-learn>=1.9.1",
+    "pillow",
+    "pytesseract",
 ]
 
 [dependency-groups]
@@ -42,6 +44,8 @@ backend = [
     "langchain-openai>=1.8.5",
     "langchain-core>=1.8.4",
     "langchain-chroma>=1.0.0",
+    "pillow",
+    "pytesseract",
 ]
 # Docker frontend image: UI only
 frontend = [

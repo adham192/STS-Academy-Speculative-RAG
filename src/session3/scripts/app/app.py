@@ -395,7 +395,7 @@ with st.sidebar:
     # ---- documents ----
     st.markdown('<div class="side-heading">Your Documents</div>', unsafe_allow_html=True)
     uploads = st.file_uploader(
-        "Upload documents", type=["pdf", "parquet", "pq", "csv", "json"], accept_multiple_files=True,
+        "Upload documents", type=["pdf", "parquet", "pq", "csv", "json", "jpg", "jpeg", "png"], accept_multiple_files=True,
         key=f"uploader_{ss.uploader_key}", label_visibility="collapsed",
     )
     if uploads and st.button("Add to knowledge base", icon=":material/upload_file:",

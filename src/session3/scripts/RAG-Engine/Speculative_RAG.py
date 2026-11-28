@@ -25,6 +25,8 @@ from langchain_core.runnables import RunnableLambda
 from langchain_core.output_parsers import StrOutputParser
 from langchain_chroma import Chroma
 from langchain_openai import ChatOpenAI, OpenAIEmbeddings
+from PIL import Image
+import pytesseract
 
 try:
     import tiktoken
@@ -145,7 +147,7 @@ def get_index_status():
     with _index_status_lock:
         return dict(INDEX_STATUS)
 
-if not any(path.suffix.lower() in (".pdf", ".parquet", ".pq", ".csv", ".json") for path in DOCS_DIR.iterdir()):
+if not any(path.suffix.lower() in (".pdf", ".parquet", ".pq", ".csv", ".json", ".jpg", ".jpeg", ".png") for path in DOCS_DIR.iterdir()):
     logger.warning("No PDF, Parquet, CSV, or JSON documents found in %s yet.", DOCS_DIR)
 
 logger.info("OpenRouter verifier model: %r | drafting model: %r", VERIFY_MODEL, DRAFT_MODEL)
@@ -253,6 +255,97 @@ def extract_pdf(pdf_path):
                 lines.append(line)
     return "\n".join(lines)
 
+def _ocr_lines(image, language):
+    data = pytesseract.image_to_data(
+        image,
+        lang=language,
+        config="--psm 6",
+        output_type=pytesseract.Output.DICT,
+    )
+
+    groups = {}
+    for index, raw_text in enumerate(data["text"]):
+        text = raw_text.strip()
+        confidence = float(data["conf"][index])
+
+        if not text or confidence < 0:
+            continue
+
+        key = (
+            int(data["block_num"][index]),
+            int(data["par_num"][index]),
+            int(data["line_num"][index]),
+        )
+        groups.setdefault(key, []).append(
+            (text, int(data["top"][index]), confidence)
+        )
+
+    lines = []
+    for words in groups.values():
+        lines.append({
+            "top": min(word[1] for word in words),
+            "text": " ".join(word[0] for word in words),
+            "confidence": sum(word[2] for word in words) / len(words),
+        })
+
+    return lines
+
+
+def _language_score(line, language):
+    text = line["text"]
+    letters = [char for char in text if char.isalpha()]
+
+    if not letters:
+        return 0.0
+
+    if language == "ara":
+        matching_letters = [
+            char for char in letters
+            if "\u0600" <= char <= "\u06ff"
+        ]
+    else:
+        matching_letters = [
+            char for char in letters
+            if ("a" <= char.lower() <= "z")
+        ]
+
+    script_ratio = len(matching_letters) / len(letters)
+    return script_ratio * line["confidence"]
+
+
+def extract_image(image_path):
+    """Extract text by selecting the clearest OCR language for each line."""
+    with Image.open(image_path) as image:
+        image = image.convert("RGB")
+        candidates = []
+
+        for language in ("ara", "eng"):
+            for line in _ocr_lines(image, language):
+                candidates.append({
+                    **line,
+                    "language": language,
+                    "score": _language_score(line, language),
+                })
+
+        line_tolerance = max(12, int(image.height * 0.012))
+        selected_lines = []
+
+        for candidate in sorted(candidates, key=lambda item: item["top"]):
+            matching_index = next(
+                (
+                    index for index, selected in enumerate(selected_lines)
+                    if abs(selected["top"] - candidate["top"]) <= line_tolerance
+                ),
+                None,
+            )
+
+            if matching_index is None:
+                selected_lines.append(candidate)
+            elif candidate["score"] > selected_lines[matching_index]["score"]:
+                selected_lines[matching_index] = candidate
+
+        selected_lines.sort(key=lambda item: item["top"])
+        return "\n".join(line["text"] for line in selected_lines)
 
 def extract_parquet(parquet_path):
     """Convert text-bearing Parquet columns into indexed document blocks."""
@@ -376,6 +469,8 @@ def extract_document(document_path):
         return extract_csv(document_path)
     if suffix == ".json":
         return extract_json(document_path)
+    if suffix in (".jpg", ".jpeg", ".png"):
+        return extract_image(document_path)
 
     raise ValueError(f"Unsupported document format: {suffix}")
 
@@ -559,7 +654,7 @@ def ingest_document(document_path, name=None, progress_callback=None):
     document_path = str(document_path)
     name = name or os.path.basename(document_path)
     suffix = Path(document_path).suffix.lower()
-    if suffix not in (".pdf", ".parquet", ".pq", ".csv", ".json"):
+    if suffix not in (".pdf", ".parquet", ".pq", ".csv", ".json", ".jpg", ".jpeg", ".png"):
         raise ValueError(f"Unsupported document format: {suffix}")
     file_hash = file_sha256(document_path)
     collection = get_chroma_collection()
@@ -690,7 +785,7 @@ def build_index():
 
     document_paths = sorted(
         path for path in DOCS_DIR.iterdir()
-        if path.suffix.lower() in (".pdf", ".parquet", ".pq", ".csv", ".json")
+        if path.suffix.lower() in (".pdf", ".parquet", ".pq", ".csv", ".json", ".jpg", ".jpeg", ".png")
     )
     logger.info("[INDEX] Checking %d document(s) in %s", len(document_paths), DOCS_DIR)
     _set_index_status(state="indexing", document=None, done=0, total=0, error=None)
@@ -999,6 +1094,7 @@ def build_subsets(
     n_subsets=DEFAULT_N_SUBSETS,
     distances=None,
     embeddings=None,
+    return_indices=False,
 ):
     """Build four-chunk evidence subsets using the embedding-guided chain strategy."""
     if len(docs) != len(labels):
@@ -1018,6 +1114,8 @@ def build_subsets(
             "so a single subset with all of them is used.",
             len(docs), CHUNKS_PER_SUBSET,
         )
+        if return_indices:
+            return [list(range(len(docs)))]
         return [list(docs)]
 
     unique_labels = sorted(set(int(label) for label in labels))
@@ -1091,7 +1189,10 @@ def build_subsets(
                 "Not enough distinct retrieved chunks."
             )
 
-        subsets.append([docs[index] for index in selected_indices])
+        if return_indices:
+            subsets.append(selected_indices)
+        else:
+            subsets.append([docs[index] for index in selected_indices])
         logger.info(
             "Subset %d: Cluster %s retrieval positions %s; Cluster %s retrieval positions %s; "
             "filler positions %s",
@@ -1122,21 +1223,21 @@ Language rules:
   Arabic, answer in clear Modern Standard Arabic even when the documents are in
   English; if the question is in English, answer in English even when the documents
   are in Arabic.
-- Keep the "rationale" quote exactly as written in the document (original language,
-  not translated).
+- Keep "evidence_quote" exactly as written in the document (original language, not translated).
 - Copy proper names, titles, dates and numbers exactly. When you translate a name
   into the answer language, you may keep the original in parentheses.
 
-Return JSON with exactly two keys, in this order: "rationale" first, then "answer".
-- "rationale": an exact short quote from the documents that supports the answer,
-  then briefly which document it came from. First locate the sentence containing
-  the requested fact; do not guess from a nearby heading or internal label.
-- "answer": written after the rationale. One complete, self-contained sentence
-  with a subject and a verb that restates what the question asked and then gives
-  the fact, so someone who has not seen the documents or the question can
-  understand it. A name or phrase on its own is not an acceptable answer.
-  If the documents give both a real name (a published model, method or product)
-  and an internal label such as "Model 3", include both; never use only the label.
+Return JSON with exactly four keys, in this order: "evidence_passage_ids", "evidence_quote", "rationale", then "answer".
+- "evidence_passage_ids": a list of the integer labels in square brackets for the passages that directly support the answer,
+   such as [2] or [1, 3]. Use only labels shown in the Documents section. Return an empty list if the documents do not contain the answer.
+- "evidence_quote": an exact short quote from the sentence in the documents that directly supports the answer. 
+   First locate the sentence containing the requested fact; do not guess from a nearby heading or internal label. 
+   Copy the quote exactly as written, without translation or paraphrasing. 
+   If the documents do not contain the answer, return an empty string.
+- "rationale": briefly explain how the evidence quote supports the answer. Do not include a document name here.
+- "answer": one complete, self-contained sentence with a subject and a verb that restates what the question asked and then gives the fact,
+   so someone who has not seen the documents or the question can understand it. A name or phrase on its own is not an acceptable answer.
+  If the documents give both a real name (a published model, method or product) and an internal label such as "Model 3", include both; never use only the label.
   If the question is broad, cover every relevant item.
 If the documents do not contain the answer, say so in the answer.
 """
@@ -1365,16 +1466,43 @@ def draft(question, subset, draft_idx=None, token_tracker=None):
 
     if raw is None:
         logger.error("[DRAFT] %s failed after %d attempts: %s", label, DRAFT_ATTEMPTS, last_error)
-        return {"answer": DRAFT_FAILED_TEXT, "rationale": "", "failed": True}
+        return {
+            "evidence_passage_ids": [],
+            "answer": DRAFT_FAILED_TEXT,
+            "rationale": "",
+            "failed": True,
+        }
 
     try:
         data = _extract_json(raw)
-        result = {"answer": str(data.get("answer", "")), "rationale": str(data.get("rationale", ""))}
+        raw_passage_ids = data.get("evidence_passage_ids", [])
+        if not isinstance(raw_passage_ids, list):
+            raw_passage_ids = []
+
+        passage_ids = []
+        for passage_id in raw_passage_ids:
+            if (
+                type(passage_id) is int
+                and 1 <= passage_id <= len(subset)
+                and passage_id not in passage_ids
+            ):
+                passage_ids.append(passage_id)
+        result = {
+            "evidence_quote": str(data.get("evidence_quote", "")).strip(),
+            "rationale": str(data.get("rationale", "")).strip(),
+            "answer": str(data.get("answer", "")).strip(),
+            "evidence_passage_ids": passage_ids,
+        }
         logger.info("[DRAFT] %s answer=%r", label, result["answer"])
         return result
     except (ValueError, AttributeError):
         logger.warning("%s was not valid JSON, using the raw text instead", label)
-        return {"answer": raw, "rationale": ""}
+        return {
+            "evidence_passage_ids": [],
+            "evidence_quote": "",
+            "answer": raw,
+            "rationale": "",
+        }
 
 
 def run_drafts(question, groups, token_tracker=None):
@@ -1430,6 +1558,12 @@ Scoring rules:
   different language than the passages; when candidates are otherwise equal, prefer
   the one written in the language of the question.
 
+Citation validation:
+- "source_passage_indexes" lists all passages the candidate saw; it does not identify the passages that support its answer.
+- "evidence_source_passage_indexes" lists the candidate's claimed supporting passages. These are zero-based indexes into "Source passages".
+- Check that the cited passages directly support the candidate's answer.
+- Penalize candidates whose cited passages are missing, irrelevant, or do not support the answer.
+
 Question:
 {question}
 
@@ -1467,6 +1601,8 @@ Apply these criteria in strict priority order:
 5. EVIDENCE: Prefer the answer whose rationale accurately quotes or points to
    passage(s) that actually support its answer. A quotation that does not prove
    the answer is not useful.
+- Check "evidence_source_passage_indexes" for each candidate. These are zero-based indexes into "Source passages". 
+  Prefer a candidate whose cited passages directly support its answer, and reject irrelevant or unsupported citations.
 6. CLARITY: If the candidates are still comparable, prefer the clearer,
    self-contained, more direct answer.
 
@@ -1613,10 +1749,11 @@ def _handle_verifier_error(error, attempt, retries, operation):
 
 
 def _build_verification_inputs(drafts, subsets):
-    """Prepare the source documents and candidate data for verifier scoring."""
+    """Prepare source passages and candidate citations for verifier scoring."""
     source_documents = []
     source_indexes = {}
     candidates = []
+
     for i, (draft_data, docs) in enumerate(zip(drafts, subsets)):
         indexes = []
         for doc in docs:
@@ -1624,14 +1761,27 @@ def _build_verification_inputs(drafts, subsets):
                 source_indexes[doc] = len(source_documents)
                 source_documents.append(doc)
             indexes.append(source_indexes[doc])
+
+        evidence_ids = draft_data.get("evidence_passage_ids", [])
+        if not isinstance(evidence_ids, list):
+            evidence_ids = []
+
+        evidence_indexes = []
+        for passage_id in evidence_ids:
+            if type(passage_id) is int and 1 <= passage_id <= len(indexes):
+                source_index = indexes[passage_id - 1]
+                if source_index not in evidence_indexes:
+                    evidence_indexes.append(source_index)
+
         candidates.append({
             "index": i,
             "answer": draft_data["answer"],
             "rationale": draft_data["rationale"],
             "source_passage_indexes": indexes,
+            "evidence_source_passage_indexes": evidence_indexes,
         })
-    return source_documents, candidates
 
+    return source_documents, candidates
 
 def resolve_tie(question, source_documents, candidates, tied_indexes, retries=3, token_tracker=None):
     """Ask the verifier to choose exactly one of the drafts tied for the highest score."""
@@ -1983,13 +2133,18 @@ def answer_question(
     )
     trace_clusters(docs, labels)
 
-    evidence_groups = build_subsets(
+    subset_indices = build_subsets(
         docs,
         labels,
         n_subsets=n_subsets,
         distances=distances,
         embeddings=embs,
+        return_indices=True,
     )
+    evidence_groups = [
+        [docs[index] for index in group]
+        for group in subset_indices
+    ]
     positions = trace_subsets(docs, labels, evidence_groups)
     group_name = "subset"
 
@@ -2026,7 +2181,20 @@ def answer_question(
 
     final_answer_tokens = count_output_tokens(final_answer)
     total_elapsed = time.perf_counter() - pipeline_start
-    sources = list(dict.fromkeys(meta["source"] for meta in metas))
+    sources = []
+    passage_ids = drafts[best].get("evidence_passage_ids", [])
+    if isinstance(passage_ids, list):
+        for passage_id in passage_ids:
+            if type(passage_id) is not int or not 1 <= passage_id <= len(subset_indices[best]):
+                continue
+
+            retrieval_index = subset_indices[best][passage_id - 1]
+            source = metas[retrieval_index].get("source")
+            if source and source not in sources:
+                sources.append(source)
+
+    if not sources:
+        logger.warning("The selected draft did not cite a valid supporting passage.")
 
     logger.info(
         "[STAGE: COMPLETE] Pipeline finished in %.2fs | Selected Draft %d (score=%.1f, reason=%s) | Sources: %s",

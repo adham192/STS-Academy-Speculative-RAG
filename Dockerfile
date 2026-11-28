@@ -62,6 +62,12 @@ COPY --from=backend-deps --chown=app:app /app/.venv /app/.venv
 COPY --chown=app:app src/logging_config.py src/logging_config.py
 COPY --chown=app:app src/session3/scripts/backend src/session3/scripts/backend
 COPY --chown=app:app src/session3/scripts/RAG-Engine src/session3/scripts/RAG-Engine
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends \
+        tesseract-ocr \
+        tesseract-ocr-ara \
+        tesseract-ocr-eng \
+    && rm -rf /var/lib/apt/lists/*
 USER app
 EXPOSE 8000
 CMD ["uvicorn", "api:app", "--app-dir", "src/session3/scripts/backend", "--host", "0.0.0.0", "--port", "8000"]
