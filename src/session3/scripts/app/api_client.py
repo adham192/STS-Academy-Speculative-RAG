@@ -1,8 +1,8 @@
 """Thin HTTP client for the backend API. The UI talks to the backend only through this."""
 
 import os
-
 import requests
+import mimetypes
 
 BACKEND_URL = os.getenv("BACKEND_URL", "http://localhost:8000").rstrip("/")
 ASK_TIMEOUT = None      # multiple OpenRouter drafts + verification can take a while
@@ -40,8 +40,13 @@ def list_documents():
 
 
 def upload_document(name, data):
-    return _request("POST", "/documents", UPLOAD_TIMEOUT, files={"file": (name, data, "application/pdf")})
-
+    content_type = mimetypes.guess_type(name)[0] or "application/octet-stream"
+    return _request(
+        "POST",
+        "/documents",
+        UPLOAD_TIMEOUT,
+        files={"file": (name, data, content_type)},
+    )
 
 def delete_document(name):
     return _request("DELETE", f"/documents/{requests.utils.quote(name, safe='')}", QUICK_TIMEOUT)

@@ -134,11 +134,11 @@ def upload_document(file: UploadFile = File(...)):
     """Save an uploaded supported document and index it."""
     name = Path(file.filename or "").name
     if not name.lower().endswith(
-        (".pdf", ".parquet", ".pq", ".csv", ".json")
+        (".pdf", ".parquet", ".pq", ".csv", ".json", ".jpg", ".jpeg", ".png")
     ):
         raise HTTPException(
             status_code=400,
-            detail="Supported files: PDF, Parquet, CSV, and XQuAD JSON.",
+            detail="Supported files: PDF, Parquet, CSV, and XQuAD JSON, JPG, JPEG, and PNG.",
         )
     rag = app.state.rag
     target = rag.DOCS_DIR / name
